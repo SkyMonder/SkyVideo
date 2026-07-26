@@ -48,7 +48,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage, limits: { fileSize: 100 * 1024 * 1024 } });
 
-// Проверка токена SkyID (оставлена для внутренних нужд, если понадобится)
+// Проверка токена SkyID (использует /me, который теперь возвращает данные в зависимости от scope)
 async function verifySkyToken(token) {
   try {
     const res = await axios.get(`${SKYID_URL}/me`, { headers: { Authorization: `Bearer ${token}` } });
@@ -64,20 +64,21 @@ function authMiddleware(req, res, next) {
     req.user = user;
     req.isAdmin = (user.login === ADMIN_LOGIN);
     next();
-  });
+  }).catch(() => res.status(401).json({ error: 'Invalid token' }));
 }
 
 // ========== Healthix ==========
 app.get('/healthix', (req, res) => res.json({ status: 'ok', service: 'skyvideo' }));
 
-// ========== OAuth Client (SkyVideo) ==========
+// ========== OAuth Client (SkyVideo) с поддержкой scope ==========
 app.get('/auth/login', (req, res) => {
   const clientId = 'skyvideo';
-  // Формируем redirect_uri на основе хоста запроса или переменной окружения
+  // Запрашиваемые права: profile (имя, аватар) и email (почта) – можно расширить
+  const scope = req.query.scope || 'profile email';
   const host = req.headers.host || `localhost:${PORT}`;
   const redirectUri = `https://${host}/auth/callback`;
   const state = crypto.randomBytes(8).toString('hex');
-  const loginUrl = `${SKYID_URL}/oauth/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}`;
+  const loginUrl = `${SKYID_URL}/oauth/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}&state=${state}`;
   res.json({ loginUrl });
 });
 
@@ -88,7 +89,7 @@ app.get('/auth/callback', async (req, res) => {
     const tokenRes = await axios.post(`${SKYID_URL}/oauth/token`, {
       code,
       client_id: 'skyvideo',
-      client_secret: 'skyvideo_secret' // можно опустить, если не проверяется
+      client_secret: 'skyvideo_secret' // совпадает с тем, что зарегистрировано в бэкенде1
     });
     const { access_token, skyid, login } = tokenRes.data;
     // Перенаправляем на страницу, которая сохранит токен и вернётся на главную
@@ -300,6 +301,11 @@ app.get('/search', (req, res) => {
     }
   }
   res.json(results.sort((a,b) => b.created - a.created));
+});
+
+// ========== Дополнительный эндпоинт для проверки токена (опционально) ==========
+app.get('/verify', authMiddleware, (req, res) => {
+  res.json({ user: req.user, isAdmin: req.isAdmin });
 });
 
 app.listen(PORT, () => console.log(`SkyVideo running on port ${PORT}`));
