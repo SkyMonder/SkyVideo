@@ -1,6 +1,6 @@
 const express = require('express');
 const http = require('http');
-const WebSocket = require('ws'); // не используется, но пусть будет для будущих фич
+const WebSocket = require('ws');
 const cors = require('cors');
 const axios = require('axios');
 const crypto = require('crypto');
@@ -20,6 +20,19 @@ const DATA_DIR = path.join(__dirname, 'data');
 const VIDEO_DIR = path.join(__dirname, 'videos');
 const UPLOAD_TEMP = path.join(__dirname, 'uploads');
 [VIDEO_DIR, UPLOAD_TEMP].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
+
+const CLIENT_SECRET = "BLx5Vp7U1c8dR2mQkG4fJ6yA9tC3bF0zH7iL2nM5oP8=";
+const CLIENT_KEY = Buffer.from(CLIENT_SECRET, 'base64');
+
+async function encryptClientResponse(plainObj) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', CLIENT_KEY, iv);
+  let encrypted = cipher.update(JSON.stringify(plainObj), 'utf8', 'base64');
+  encrypted += cipher.final('base64');
+  const authTag = cipher.getAuthTag();
+  const combined = Buffer.concat([iv, Buffer.from(encrypted, 'base64'), authTag]);
+  return combined.toString('base64');
+}
 
 function dbPut(bucket, key, data) {
   const dir = path.join(DATA_DIR, bucket);
@@ -68,22 +81,31 @@ function authMiddleware(req, res, next) {
 // ========== Healthix ==========
 app.get('/healthix', (req, res) => res.json({ status: 'ok', service: 'skyvideo' }));
 
-// ========== Авторизация ==========
+// ========== Авторизация (с шифрованием) ==========
 app.post('/auth/register', async (req, res) => {
   const { login, password } = req.body;
   if (!login || !password) return res.status(400).json({ error: 'login/password required' });
   try {
-    const resp = await axios.post(`${SKYID_URL}/register`, { login, password });
+    const encryptedPayload = await encryptClientResponse({ login, password });
+    const resp = await axios.post(`${SKYID_URL}/register`, { data: encryptedPayload });
     res.json(resp.data);
-  } catch (e) { res.status(e.response?.status || 500).json(e.response?.data || { error: 'Registration failed' }); }
+  } catch (e) {
+    console.error('Register error:', e.response?.data || e);
+    res.status(e.response?.status || 500).json(e.response?.data || { error: 'Registration failed' });
+  }
 });
+
 app.post('/auth/login', async (req, res) => {
   const { login, password } = req.body;
   if (!login || !password) return res.status(400).json({ error: 'login/password required' });
   try {
-    const resp = await axios.post(`${SKYID_URL}/login`, { login, password });
+    const encryptedPayload = await encryptClientResponse({ login, password });
+    const resp = await axios.post(`${SKYID_URL}/login`, { data: encryptedPayload });
     res.json(resp.data);
-  } catch (e) { res.status(e.response?.status || 500).json(e.response?.data || { error: 'Login failed' }); }
+  } catch (e) {
+    console.error('Login error:', e.response?.data || e);
+    res.status(e.response?.status || 500).json(e.response?.data || { error: 'Login failed' });
+  }
 });
 
 // ========== Профиль (имя канала) ==========
@@ -232,7 +254,6 @@ app.delete('/video/:id', authMiddleware, (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
   if (meta.skyid !== req.user.skyid && !req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
-  // удалить файл
   const videoPath = path.join(VIDEO_DIR, meta.filename);
   if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
   dbDelete('videos', req.params.id);
