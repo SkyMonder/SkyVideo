@@ -70,7 +70,58 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-// ====== Проверка токена ======
+// ====== Настройки ИИ-модерации ======
+const AI_API_URL = 'https://api-inference.huggingface.co/models/unitary/toxic-bert';
+const AI_API_KEY = process.env.HF_API_KEY; // Получите ключ на huggingface.co
+const TOXICITY_THRESHOLD = 0.8;
+
+async function checkAI(text) {
+  if (!AI_API_KEY) {
+    console.warn('⚠️ HF_API_KEY не задан, ИИ-модерация отключена');
+    return { toxic: false, score: 0 };
+  }
+  try {
+    const response = await axios.post(
+      AI_API_URL,
+      { inputs: text },
+      {
+        headers: { Authorization: `Bearer ${AI_API_KEY}` },
+        timeout: 5000,
+      }
+    );
+    const results = response.data[0] || [];
+    const toxic = results.find(r => r.label === 'toxic');
+    const score = toxic ? toxic.score : 0;
+    return { toxic: score >= TOXICITY_THRESHOLD, score };
+  } catch (e) {
+    console.error('❌ Ошибка ИИ-модерации:', e.message);
+    return { toxic: false, score: 0 };
+  }
+}
+
+// ====== Бан с длительностью ======
+function banUserWithDuration(skyid, reason, days = 2) {
+  const until = Date.now() + days * 24 * 60 * 60 * 1000;
+  dbPut('bans', skyid, {
+    skyid,
+    reason: reason || 'Нарушение правил (ИИ)',
+    bannedAt: Date.now(),
+    until: until,
+  });
+  console.log(`🔨 Пользователь ${skyid} забанен до ${new Date(until).toISOString()}`);
+}
+
+function isUserBanned(skyid) {
+  const ban = dbGet('bans', skyid);
+  if (!ban) return false;
+  if (ban.until && Date.now() > ban.until) {
+    dbDelete('bans', skyid);
+    return false;
+  }
+  return true;
+}
+
+// ====== Проверка токена и прав ======
 async function verifySkyToken(token) {
   try {
     const res = await axios.get(`${SKYID_URL}/me`, { headers: { Authorization: `Bearer ${token}` } });
@@ -83,10 +134,25 @@ function authMiddleware(req, res, next) {
   if (!auth) return res.status(401).json({ error: 'Unauthorized' });
   verifySkyToken(auth).then(user => {
     if (!user) return res.status(401).json({ error: 'Invalid token' });
+    // Проверка бана
+    if (isUserBanned(user.skyid)) {
+      const ban = dbGet('bans', user.skyid);
+      const remaining = Math.ceil((ban.until - Date.now()) / (1000 * 60 * 60));
+      return res.status(403).json({
+        error: `Вы забанены до ${new Date(ban.until).toLocaleString()}. Осталось ${remaining} часов.`
+      });
+    }
     req.user = user;
     req.isAdmin = (user.login === ADMIN_LOGIN);
     next();
   }).catch(() => res.status(401).json({ error: 'Invalid token' }));
+}
+
+function adminMiddleware(req, res, next) {
+  if (!req.user || !req.isAdmin) {
+    return res.status(403).json({ error: 'Forbidden. Только для администратора.' });
+  }
+  next();
 }
 
 // ====== Health ======
@@ -153,9 +219,8 @@ app.put('/profile', authMiddleware, (req, res) => {
   res.json(profile);
 });
 
-// ====== Генерация превью (асинхронно) ======
+// ====== Генерация превью ======
 async function generateThumbnail(videoId, videoPath) {
-  // Проверяем наличие ffmpeg
   let ffmpegCmd = 'ffmpeg';
   try {
     await new Promise((resolve, reject) => {
@@ -167,7 +232,6 @@ async function generateThumbnail(videoId, videoPath) {
     console.warn('⚠️ FFmpeg не установлен, превью не будет создано');
     return null;
   }
-
   const thumbPath = path.join(THUMB_DIR, videoId + '.jpg');
   try {
     const ff = spawn(ffmpegCmd, [
@@ -179,12 +243,10 @@ async function generateThumbnail(videoId, videoPath) {
       '-y',
       thumbPath
     ]);
-
     await new Promise((resolve, reject) => {
       ff.on('close', (code) => code === 0 ? resolve() : reject(new Error('FFmpeg failed')));
       ff.on('error', reject);
     });
-
     console.log(`✅ Превью создано для видео ${videoId}`);
     return `/thumbnails/${videoId}.jpg`;
   } catch (e) {
@@ -196,21 +258,24 @@ async function generateThumbnail(videoId, videoPath) {
 // ====== Загрузка видео ======
 app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => {
   try {
-    console.log('📥 Начало загрузки файла');
     const file = req.file;
-    if (!file) {
-      console.error('❌ Файл не получен');
-      return res.status(400).json({ error: 'No video file' });
-    }
-    console.log(`📄 Имя: ${file.originalname}, Размер: ${file.size} байт`);
+    if (!file) return res.status(400).json({ error: 'No video file' });
     const videoId = 'vid_' + Date.now();
     const videoPath = file.path;
     const { title, description, tags } = req.body;
     const tagArray = tags ? tags.split(',').map(t => t.trim()).filter(Boolean) : [];
 
+    // ИИ-модерация
+    const fullText = title + ' ' + description + ' ' + (tags || '').join(' ');
+    const aiResult = await checkAI(fullText);
+    if (aiResult.toxic) {
+      if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+      banUserWithDuration(req.user.skyid, 'Токсичный контент в видео');
+      return res.status(403).json({ error: 'Ваше видео содержит неприемлемый контент. Вы забанены на 2 дня.' });
+    }
+
     const targetPath = path.join(VIDEO_DIR, videoId + path.extname(file.originalname));
     fs.renameSync(videoPath, targetPath);
-
     const stat = fs.statSync(targetPath);
 
     const meta = {
@@ -230,11 +295,11 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
       size: stat.size,
       mimetype: file.mimetype || 'video/mp4',
       duration: 0,
-      thumbnail: null // будет заполнено после генерации
+      thumbnail: null,
+      moderated: true
     };
     dbPut('videos', videoId, meta);
 
-    // Запускаем генерацию превью в фоне
     generateThumbnail(videoId, targetPath).then(thumbUrl => {
       if (thumbUrl) {
         const updated = dbGet('videos', videoId);
@@ -245,7 +310,6 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
       }
     });
 
-    console.log(`✅ Видео ${videoId} загружено`);
     res.json({ ok: true, videoId, video: meta });
   } catch (e) {
     console.error('❌ Ошибка загрузки:', e);
@@ -263,7 +327,7 @@ app.get('/thumbnails/:filename', (req, res) => {
   res.sendFile(thumbPath);
 });
 
-// ====== Стриминг видео ======
+// ====== Стриминг ======
 app.get('/video/:id', (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
@@ -343,22 +407,38 @@ app.get('/video/:id/comments', (req, res) => {
   if (!meta) return res.status(404).json({ error: 'Not found' });
   res.json(meta.comments || []);
 });
-app.post('/video/:id/comment', authMiddleware, (req, res) => {
+app.post('/video/:id/comment', authMiddleware, async (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: 'Text required' });
+
+  // ИИ-модерация комментария
+  const aiResult = await checkAI(text);
+  if (aiResult.toxic) {
+    banUserWithDuration(req.user.skyid, 'Токсичный комментарий');
+    return res.status(403).json({ error: 'Ваш комментарий содержит неприемлемый контент. Вы забанены на 2 дня.' });
+  }
+
   const comment = { id: 'cmt_' + Date.now(), skyid: req.user.skyid, author: req.user.login, text, created: Date.now() };
   meta.comments.push(comment);
   dbPut('videos', req.params.id, meta);
   res.json(comment);
 });
-app.put('/video/:id/comment/:commentId', authMiddleware, (req, res) => {
+app.put('/video/:id/comment/:commentId', authMiddleware, async (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
   const comment = meta.comments.find(c => c.id === req.params.commentId);
   if (!comment) return res.status(404).json({ error: 'Comment not found' });
   if (comment.skyid !== req.user.skyid && !req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
+
+  // ИИ-модерация при редактировании
+  const aiResult = await checkAI(req.body.text);
+  if (aiResult.toxic) {
+    banUserWithDuration(req.user.skyid, 'Токсичный комментарий (редактирование)');
+    return res.status(403).json({ error: 'Ваш комментарий содержит неприемлемый контент. Вы забанены на 2 дня.' });
+  }
+
   comment.text = req.body.text;
   dbPut('videos', req.params.id, meta);
   res.json(comment);
@@ -387,7 +467,7 @@ app.delete('/video/:id', authMiddleware, (req, res) => {
   res.json({ ok: true });
 });
 
-// ====== ПОДПИСКИ ======
+// ====== Подписки ======
 app.post('/follow/:skyid', authMiddleware, (req, res) => {
   const targetSkyid = req.params.skyid;
   if (targetSkyid === req.user.skyid) return res.status(400).json({ error: 'Нельзя подписаться на себя' });
@@ -398,7 +478,6 @@ app.post('/follow/:skyid', authMiddleware, (req, res) => {
   }
   res.json({ ok: true, following: follows.following });
 });
-
 app.delete('/follow/:skyid', authMiddleware, (req, res) => {
   const targetSkyid = req.params.skyid;
   let follows = dbGet('follows', req.user.skyid) || { following: [] };
@@ -406,12 +485,10 @@ app.delete('/follow/:skyid', authMiddleware, (req, res) => {
   dbPut('follows', req.user.skyid, follows);
   res.json({ ok: true, following: follows.following });
 });
-
 app.get('/follow/following', authMiddleware, (req, res) => {
   const follows = dbGet('follows', req.user.skyid) || { following: [] };
   res.json({ following: follows.following });
 });
-
 app.get('/follow/followers/:skyid', (req, res) => {
   const targetSkyid = req.params.skyid;
   const allFollows = dbList('follows');
@@ -424,11 +501,206 @@ app.get('/follow/followers/:skyid', (req, res) => {
   }
   res.json({ followers });
 });
-
 app.get('/follow/check/:skyid', authMiddleware, (req, res) => {
   const targetSkyid = req.params.skyid;
   const follows = dbGet('follows', req.user.skyid) || { following: [] };
   res.json({ isFollowing: follows.following.includes(targetSkyid) });
+});
+
+// ====== Админ-панель ======
+app.get('/admin/panel', authMiddleware, adminMiddleware, (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="UTF-8">
+      <title>Админ-панель SkyVideo</title>
+      <style>
+        body { background: #0a0f1e; color: #e0e8ff; font-family: Arial, sans-serif; padding: 20px; }
+        h1 { color: #5f7ecf; }
+        .admin-section { background: #1a233a; border: 1px solid #2a3450; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+        .admin-section h2 { border-bottom: 1px solid #2a3450; padding-bottom: 10px; }
+        button { background: #5f7ecf; border: none; color: white; padding: 6px 12px; border-radius: 6px; cursor: pointer; }
+        .btn-danger { background: #c44; }
+        .item { background: #111827; padding: 10px; border-radius: 8px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+        .item .actions { display: flex; gap: 8px; }
+        input, textarea { background: #0d1225; border: 1px solid #3a4660; color: white; padding: 6px; border-radius: 6px; width: 100%; margin-bottom: 8px; }
+      </style>
+    </head>
+    <body>
+      <h1>🛡️ Админ-панель SkyVideo</h1>
+      <div id="app">
+        <div class="admin-section">
+          <h2>📹 Все видео</h2>
+          <div id="video-list">Загрузка...</div>
+        </div>
+        <div class="admin-section">
+          <h2>💬 Все комментарии</h2>
+          <div id="comments-list">Загрузка...</div>
+        </div>
+        <div class="admin-section">
+          <h2>🚫 Бан пользователей</h2>
+          <input type="text" id="ban-skyid" placeholder="SkyID пользователя">
+          <button onclick="banUser()">Забанить (2 дня)</button>
+          <button onclick="unbanUser()" class="btn-danger">Разбанить</button>
+          <div id="ban-result"></div>
+        </div>
+        <div class="admin-section">
+          <h2>🔒 Забаненные (срок)</h2>
+          <div id="banned-list">Загрузка...</div>
+        </div>
+      </div>
+      <script>
+        const API_BASE = 'https://skyvideo.onrender.com';
+        let token = localStorage.getItem('skyvideo_token');
+
+        async function apiFetch(url, options = {}) {
+          const headers = { 'Content-Type': 'application/json' };
+          if (token) headers['Authorization'] = 'Bearer ' + token;
+          const res = await fetch(API_BASE + url, { ...options, headers });
+          if (!res.ok) throw new Error(await res.text());
+          return res.json();
+        }
+
+        async function loadVideos() {
+          const data = await apiFetch('/admin/videos');
+          const container = document.getElementById('video-list');
+          if (!data.length) { container.innerHTML = '<p>Нет видео</p>'; return; }
+          container.innerHTML = data.map(v => \`
+            <div class="item">
+              <div><strong>\${v.title}</strong> (автор: \${v.author})</div>
+              <div class="actions">
+                <button onclick="deleteVideo('\${v.id}')" class="btn-danger">Удалить</button>
+              </div>
+            </div>
+          \`).join('');
+        }
+
+        async function loadComments() {
+          const videos = await apiFetch('/admin/videos');
+          let allComments = [];
+          for (const v of videos) {
+            allComments = allComments.concat((v.comments || []).map(c => ({ ...c, videoId: v.id, videoTitle: v.title })));
+          }
+          const container = document.getElementById('comments-list');
+          if (!allComments.length) { container.innerHTML = '<p>Нет комментариев</p>'; return; }
+          container.innerHTML = allComments.map(c => \`
+            <div class="item">
+              <div><strong>\${c.author}</strong>: \${c.text} (видео: \${c.videoTitle})</div>
+              <div class="actions">
+                <button onclick="deleteComment('\${c.videoId}','\${c.id}')" class="btn-danger">Удалить</button>
+              </div>
+            </div>
+          \`).join('');
+        }
+
+        async function deleteVideo(videoId) {
+          if (!confirm('Удалить видео?')) return;
+          await apiFetch('/admin/video/' + videoId, { method: 'DELETE' });
+          loadVideos();
+        }
+
+        async function deleteComment(videoId, commentId) {
+          if (!confirm('Удалить комментарий?')) return;
+          await apiFetch('/admin/comment/' + videoId + '/' + commentId, { method: 'DELETE' });
+          loadComments();
+        }
+
+        async function banUser() {
+          const skyid = document.getElementById('ban-skyid').value.trim();
+          if (!skyid) return alert('Введите SkyID');
+          await apiFetch('/admin/ban', { method: 'POST', body: JSON.stringify({ skyid }) });
+          document.getElementById('ban-result').textContent = '✅ Пользователь забанен на 2 дня';
+          loadBanned();
+        }
+
+        async function unbanUser() {
+          const skyid = document.getElementById('ban-skyid').value.trim();
+          if (!skyid) return alert('Введите SkyID');
+          await apiFetch('/admin/unban', { method: 'POST', body: JSON.stringify({ skyid }) });
+          document.getElementById('ban-result').textContent = '✅ Пользователь разбанен';
+          loadBanned();
+        }
+
+        async function loadBanned() {
+          const data = await apiFetch('/admin/banned');
+          const container = document.getElementById('banned-list');
+          if (!data.length) { container.innerHTML = '<p>Нет забаненных</p>'; return; }
+          container.innerHTML = data.map(b => \`
+            <div class="item">
+              <div>
+                <strong>\${b.skyid}</strong>
+                <span style="color:#8899cc;">(до \${new Date(b.until).toLocaleString()})</span>
+              </div>
+              <div class="actions">
+                <button onclick="unbanUserById('\${b.skyid}')" class="btn-danger">Разбанить</button>
+              </div>
+            </div>
+          \`).join('');
+        }
+
+        // Дополнительная функция для разбана по клику из списка
+        window.unbanUserById = async (skyid) => {
+          await apiFetch('/admin/unban', { method: 'POST', body: JSON.stringify({ skyid }) });
+          loadBanned();
+        };
+
+        loadVideos();
+        loadComments();
+        loadBanned();
+      </script>
+    </body>
+    </html>
+  `);
+});
+
+// Админ-эндпоинты
+app.get('/admin/videos', authMiddleware, adminMiddleware, (req, res) => {
+  const ids = dbList('videos');
+  const videos = ids.map(id => dbGet('videos', id)).filter(Boolean).sort((a,b) => b.created - a.created);
+  res.json(videos);
+});
+
+app.delete('/admin/video/:videoId', authMiddleware, adminMiddleware, (req, res) => {
+  const meta = dbGet('videos', req.params.videoId);
+  if (!meta) return res.status(404).json({ error: 'Not found' });
+  const videoPath = path.join(VIDEO_DIR, meta.filename);
+  if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+  const thumbPath = path.join(THUMB_DIR, meta.id + '.jpg');
+  if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
+  dbDelete('videos', req.params.videoId);
+  res.json({ ok: true });
+});
+
+app.delete('/admin/comment/:videoId/:commentId', authMiddleware, adminMiddleware, (req, res) => {
+  const meta = dbGet('videos', req.params.videoId);
+  if (!meta) return res.status(404).json({ error: 'Video not found' });
+  const comment = meta.comments.find(c => c.id === req.params.commentId);
+  if (!comment) return res.status(404).json({ error: 'Comment not found' });
+  meta.comments = meta.comments.filter(c => c.id !== req.params.commentId);
+  dbPut('videos', req.params.videoId, meta);
+  res.json({ ok: true });
+});
+
+app.post('/admin/ban', authMiddleware, adminMiddleware, (req, res) => {
+  const { skyid } = req.body;
+  if (!skyid) return res.status(400).json({ error: 'skyid required' });
+  banUserWithDuration(skyid, 'Ручной бан (админ)', 2);
+  res.json({ ok: true });
+});
+
+app.post('/admin/unban', authMiddleware, adminMiddleware, (req, res) => {
+  const { skyid } = req.body;
+  dbDelete('bans', skyid);
+  res.json({ ok: true });
+});
+
+app.get('/admin/banned', authMiddleware, adminMiddleware, (req, res) => {
+  const ids = dbList('bans');
+  const banned = ids.map(id => dbGet('bans', id)).filter(Boolean);
+  // Фильтруем только активные
+  const active = banned.filter(b => !b.until || Date.now() < b.until);
+  res.json(active);
 });
 
 // ====== Список видео ======
@@ -453,21 +725,6 @@ app.get('/search', (req, res) => {
   res.json(results.sort((a,b) => b.created - a.created));
 });
 
-// ====== Админ ======
-app.post('/admin/ban', authMiddleware, (req, res) => {
-  if (!req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
-  const { skyid } = req.body;
-  if (!skyid) return res.status(400).json({ error: 'skyid required' });
-  dbPut('bans', skyid, { skyid, bannedAt: Date.now() });
-  res.json({ ok: true });
-});
-app.post('/admin/unban', authMiddleware, (req, res) => {
-  if (!req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
-  const { skyid } = req.body;
-  dbDelete('bans', skyid);
-  res.json({ ok: true });
-});
-
 // ====== Проверка токена ======
 app.get('/verify', authMiddleware, (req, res) => {
   res.json({ user: req.user, isAdmin: req.isAdmin });
@@ -481,5 +738,5 @@ server.headersTimeout = 60 * 60 * 1000;
 
 server.listen(PORT, () => {
   console.log(`🚀 SkyVideo running on port ${PORT}`);
-  console.log(`⚡ Все эндпоинты зарегистрированы`);
+  console.log(`🤖 ИИ-модерация ${AI_API_KEY ? 'активна' : 'отключена (нет ключа)'}`);
 });
