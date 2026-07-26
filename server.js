@@ -1,12 +1,12 @@
 const express = require('express');
 const http = require('http');
-const WebSocket = require('ws');
 const cors = require('cors');
 const axios = require('axios');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
+const { spawn } = require('child_process');
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
@@ -21,7 +21,8 @@ const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'SkyMonder';
 const DATA_DIR = path.join(__dirname, 'data');
 const VIDEO_DIR = path.join(__dirname, 'videos');
 const UPLOAD_TEMP = path.join(__dirname, 'uploads');
-[VIDEO_DIR, UPLOAD_TEMP, DATA_DIR].forEach(d => {
+const THUMB_DIR = path.join(VIDEO_DIR, 'thumbnails');
+[VIDEO_DIR, UPLOAD_TEMP, DATA_DIR, THUMB_DIR].forEach(d => {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 });
 
@@ -85,10 +86,7 @@ function authMiddleware(req, res, next) {
     req.user = user;
     req.isAdmin = (user.login === ADMIN_LOGIN);
     next();
-  }).catch((err) => {
-    console.error('Auth error:', err);
-    res.status(401).json({ error: 'Invalid token' });
-  });
+  }).catch(() => res.status(401).json({ error: 'Invalid token' }));
 }
 
 // ====== Health ======
@@ -155,6 +153,46 @@ app.put('/profile', authMiddleware, (req, res) => {
   res.json(profile);
 });
 
+// ====== Генерация превью (асинхронно) ======
+async function generateThumbnail(videoId, videoPath) {
+  // Проверяем наличие ffmpeg
+  let ffmpegCmd = 'ffmpeg';
+  try {
+    await new Promise((resolve, reject) => {
+      const test = spawn(ffmpegCmd, ['-version']);
+      test.on('close', (code) => code === 0 ? resolve() : reject());
+      test.on('error', reject);
+    });
+  } catch (e) {
+    console.warn('⚠️ FFmpeg не установлен, превью не будет создано');
+    return null;
+  }
+
+  const thumbPath = path.join(THUMB_DIR, videoId + '.jpg');
+  try {
+    const ff = spawn(ffmpegCmd, [
+      '-i', videoPath,
+      '-ss', '00:00:01',
+      '-vframes', '1',
+      '-vf', 'scale=320:180',
+      '-q:v', '2',
+      '-y',
+      thumbPath
+    ]);
+
+    await new Promise((resolve, reject) => {
+      ff.on('close', (code) => code === 0 ? resolve() : reject(new Error('FFmpeg failed')));
+      ff.on('error', reject);
+    });
+
+    console.log(`✅ Превью создано для видео ${videoId}`);
+    return `/thumbnails/${videoId}.jpg`;
+  } catch (e) {
+    console.error('❌ Ошибка генерации превью:', e.message);
+    return null;
+  }
+}
+
 // ====== Загрузка видео ======
 app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => {
   try {
@@ -191,9 +229,21 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
       filename: path.basename(targetPath),
       size: stat.size,
       mimetype: file.mimetype || 'video/mp4',
-      duration: 0
+      duration: 0,
+      thumbnail: null // будет заполнено после генерации
     };
     dbPut('videos', videoId, meta);
+
+    // Запускаем генерацию превью в фоне
+    generateThumbnail(videoId, targetPath).then(thumbUrl => {
+      if (thumbUrl) {
+        const updated = dbGet('videos', videoId);
+        if (updated) {
+          updated.thumbnail = thumbUrl;
+          dbPut('videos', videoId, updated);
+        }
+      }
+    });
 
     console.log(`✅ Видео ${videoId} загружено`);
     res.json({ ok: true, videoId, video: meta });
@@ -206,7 +256,14 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
   }
 });
 
-// ====== Стриминг ======
+// ====== Раздача превью ======
+app.get('/thumbnails/:filename', (req, res) => {
+  const thumbPath = path.join(THUMB_DIR, req.params.filename);
+  if (!fs.existsSync(thumbPath)) return res.status(404).send('Not found');
+  res.sendFile(thumbPath);
+});
+
+// ====== Стриминг видео ======
 app.get('/video/:id', (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
@@ -324,6 +381,8 @@ app.delete('/video/:id', authMiddleware, (req, res) => {
   if (meta.authorSkyid !== req.user.skyid && !req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
   const videoPath = path.join(VIDEO_DIR, meta.filename);
   if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+  const thumbPath = path.join(THUMB_DIR, meta.id + '.jpg');
+  if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
   dbDelete('videos', req.params.id);
   res.json({ ok: true });
 });
