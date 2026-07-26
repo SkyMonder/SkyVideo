@@ -149,11 +149,10 @@ function containsBadWords(text) {
 
 // ====== ИИ-модерация через Hugging Face Inference API ======
 const AI_API_URL = 'https://api-inference.huggingface.co/models/Nelera/ru-toxicity-detection';
-const AI_API_KEY = process.env.HF_API_KEY; // Бесплатный ключ на huggingface.co/settings/tokens
+const AI_API_KEY = process.env.HF_API_KEY;
 const TOXICITY_THRESHOLD = 0.8;
 
 async function checkAI(text) {
-  // Если нет ключа, сразу проверяем по локальному списку
   if (!AI_API_KEY) {
     console.warn('⚠️ HF_API_KEY не задан, используем локальный список слов');
     return { toxic: containsBadWords(text), score: containsBadWords(text) ? 1 : 0 };
@@ -167,16 +166,13 @@ async function checkAI(text) {
         timeout: 5000,
       }
     );
-    // Модель возвращает массив: [ { label: 'LABEL_1' or 'LABEL_0', score: 0.99 } ]
     const result = response.data[0] || {};
     const isToxic = result.label === 'LABEL_1';
     const score = result.score || 0;
-    // Комбинируем с локальным списком
     const localResult = containsBadWords(text);
     return { toxic: isToxic || localResult, score: Math.max(score, localResult ? 1 : 0) };
   } catch (e) {
     console.error('❌ Ошибка ИИ-модерации:', e.message);
-    // При ошибке используем локальный список
     return { toxic: containsBadWords(text), score: containsBadWords(text) ? 1 : 0 };
   }
 }
@@ -346,7 +342,6 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
     const { title, description, tags } = req.body;
     const tagArray = tags ? tags.split(',').map(t => t.trim()).filter(Boolean) : [];
 
-    // Проверка через ИИ (с fallback на локальный список)
     const fullText = title + ' ' + description + ' ' + tagArray.join(' ');
     const aiResult = await checkAI(fullText);
     if (aiResult.toxic) {
@@ -494,7 +489,6 @@ app.post('/video/:id/comment', authMiddleware, async (req, res) => {
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: 'Text required' });
 
-  // Проверка через ИИ (с fallback на локальный список)
   const aiResult = await checkAI(text);
   if (aiResult.toxic) {
     banUserWithDuration(req.user.skyid, 'Токсичный комментарий');
@@ -587,8 +581,9 @@ app.get('/follow/check/:skyid', authMiddleware, (req, res) => {
   res.json({ isFollowing: follows.following.includes(targetSkyid) });
 });
 
-// ====== Админ-панель ======
-app.get('/admin/panel', authMiddleware, adminMiddleware, (req, res) => {
+// ====== АДМИН-ПАНЕЛЬ (открытая страница, но защищённые API) ======
+// Отдаём HTML без проверки токена — клиентский скрипт сам проверит токен
+app.get('/admin/panel', (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html>
@@ -605,40 +600,43 @@ app.get('/admin/panel', authMiddleware, adminMiddleware, (req, res) => {
         .item { background: #111827; padding: 10px; border-radius: 8px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
         .item .actions { display: flex; gap: 8px; }
         input, textarea { background: #0d1225; border: 1px solid #3a4660; color: white; padding: 6px; border-radius: 6px; width: 100%; margin-bottom: 8px; }
+        .error-message { color: #f48024; text-align: center; margin-top: 20px; }
       </style>
     </head>
     <body>
       <h1>🛡️ Админ-панель SkyVideo</h1>
-      <div id="app">
-        <div class="admin-section">
-          <h2>📹 Все видео</h2>
-          <div id="video-list">Загрузка...</div>
-        </div>
-        <div class="admin-section">
-          <h2>💬 Все комментарии</h2>
-          <div id="comments-list">Загрузка...</div>
-        </div>
-        <div class="admin-section">
-          <h2>🚫 Бан пользователей</h2>
-          <input type="text" id="ban-skyid" placeholder="SkyID пользователя">
-          <button onclick="banUser()">Забанить (2 дня)</button>
-          <button onclick="unbanUser()" class="btn-danger">Разбанить</button>
-          <div id="ban-result"></div>
-        </div>
-        <div class="admin-section">
-          <h2>🔒 Забаненные (срок)</h2>
-          <div id="banned-list">Загрузка...</div>
-        </div>
-      </div>
+      <div id="app"></div>
       <script>
-        const API_BASE = 'https://skyvideo.onrender.com';
-        let token = localStorage.getItem('skyvideo_token');
+        const API_BASE = '${req.protocol}://${req.get('host')}';
+        const token = localStorage.getItem('skyvideo_token');
+        if (!token) {
+          document.getElementById('app').innerHTML = \`
+            <div class="error-message">
+              <h2>⛔ Не авторизован</h2>
+              <p>Для доступа к админ-панели необходимо войти в SkyVideo как администратор.</p>
+              <a href="/" style="color:#5f7ecf;">Вернуться на главную</a>
+            </div>
+          \`;
+          throw new Error('No token');
+        }
 
         async function apiFetch(url, options = {}) {
           const headers = { 'Content-Type': 'application/json' };
           if (token) headers['Authorization'] = 'Bearer ' + token;
           const res = await fetch(API_BASE + url, { ...options, headers });
-          if (!res.ok) throw new Error(await res.text());
+          if (!res.ok) {
+            if (res.status === 401 || res.status === 403) {
+              document.getElementById('app').innerHTML = \`
+                <div class="error-message">
+                  <h2>⛔ Доступ запрещён</h2>
+                  <p>У вас нет прав администратора. Войдите как SkyMonder.</p>
+                  <a href="/" style="color:#5f7ecf;">Вернуться на главную</a>
+                </div>
+              \`;
+              throw new Error('Forbidden');
+            }
+            throw new Error(await res.text());
+          }
           return res.json();
         }
 
@@ -724,6 +722,29 @@ app.get('/admin/panel', authMiddleware, adminMiddleware, (req, res) => {
           loadBanned();
         };
 
+        // Рендерим админку
+        document.getElementById('app').innerHTML = \`
+          <div class="admin-section">
+            <h2>📹 Все видео</h2>
+            <div id="video-list">Загрузка...</div>
+          </div>
+          <div class="admin-section">
+            <h2>💬 Все комментарии</h2>
+            <div id="comments-list">Загрузка...</div>
+          </div>
+          <div class="admin-section">
+            <h2>🚫 Бан пользователей</h2>
+            <input type="text" id="ban-skyid" placeholder="SkyID пользователя">
+            <button onclick="banUser()">Забанить (2 дня)</button>
+            <button onclick="unbanUser()" class="btn-danger">Разбанить</button>
+            <div id="ban-result"></div>
+          </div>
+          <div class="admin-section">
+            <h2>🔒 Забаненные (срок)</h2>
+            <div id="banned-list">Загрузка...</div>
+          </div>
+        \`;
+
         loadVideos();
         loadComments();
         loadBanned();
@@ -733,7 +754,7 @@ app.get('/admin/panel', authMiddleware, adminMiddleware, (req, res) => {
   `);
 });
 
-// ====== Админ-эндпоинты ======
+// ====== Админ-эндпоинты (защищены) ======
 app.get('/admin/videos', authMiddleware, adminMiddleware, (req, res) => {
   const ids = dbList('videos');
   const videos = ids.map(id => dbGet('videos', id)).filter(Boolean).sort((a,b) => b.created - a.created);
