@@ -21,19 +21,7 @@ const VIDEO_DIR = path.join(__dirname, 'videos');
 const UPLOAD_TEMP = path.join(__dirname, 'uploads');
 [VIDEO_DIR, UPLOAD_TEMP].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
 
-const CLIENT_SECRET = "BLx5Vp7U1c8dR2mQkG4fJ6yA9tC3bF0zH7iL2nM5oP8=";
-const CLIENT_KEY = Buffer.from(CLIENT_SECRET, 'base64');
-
-async function encryptClientResponse(plainObj) {
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', CLIENT_KEY, iv);
-  let encrypted = cipher.update(JSON.stringify(plainObj), 'utf8', 'base64');
-  encrypted += cipher.final('base64');
-  const authTag = cipher.getAuthTag();
-  const combined = Buffer.concat([iv, Buffer.from(encrypted, 'base64'), authTag]);
-  return combined.toString('base64');
-}
-
+// ---------- Файловая БД ----------
 function dbPut(bucket, key, data) {
   const dir = path.join(DATA_DIR, bucket);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -60,6 +48,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage, limits: { fileSize: 100 * 1024 * 1024 } });
 
+// Проверка токена SkyID (оставлена для внутренних нужд, если понадобится)
 async function verifySkyToken(token) {
   try {
     const res = await axios.get(`${SKYID_URL}/me`, { headers: { Authorization: `Bearer ${token}` } });
@@ -82,47 +71,49 @@ function authMiddleware(req, res, next) {
 app.get('/healthix', (req, res) => res.json({ status: 'ok', service: 'skyvideo' }));
 
 // ========== OAuth Client (SkyVideo) ==========
-// Генерируем URL для входа через SkyID
 app.get('/auth/login', (req, res) => {
-  const clientId = 'skyvideo'; // уникальный идентификатор приложения
-  const redirectUri = `${SKYVIDEO_URL}/auth/callback`;
+  const clientId = 'skyvideo';
+  // Формируем redirect_uri на основе хоста запроса или переменной окружения
+  const host = req.headers.host || `localhost:${PORT}`;
+  const redirectUri = `https://${host}/auth/callback`;
   const state = crypto.randomBytes(8).toString('hex');
-  // Сохраняем state в куки или сессию (для простоты передадим в URL)
   const loginUrl = `${SKYID_URL}/oauth/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}`;
   res.json({ loginUrl });
 });
 
-// Колбэк после успешного входа в SkyID
 app.get('/auth/callback', async (req, res) => {
   const { code, state } = req.query;
   if (!code) return res.status(400).send('Missing code');
   try {
-    // Обмениваем код на токен
     const tokenRes = await axios.post(`${SKYID_URL}/oauth/token`, {
       code,
       client_id: 'skyvideo',
-      client_secret: 'skyvideo_secret' // пока не проверяется, но можно добавить
+      client_secret: 'skyvideo_secret' // можно опустить, если не проверяется
     });
     const { access_token, skyid, login } = tokenRes.data;
-    // Можно сразу отдать токен клиенту через редирект с параметром
-    // Для простоты вернём JSON (клиент должен будет запросить его через fetch)
-    // Но лучше сделать редирект на страницу с передачей токена через URL-хэш
+    // Перенаправляем на страницу, которая сохранит токен и вернётся на главную
     res.redirect(`/auth/success?token=${access_token}&skyid=${skyid}&login=${login}`);
   } catch (e) {
+    console.error('OAuth callback error:', e.response?.data || e);
     res.status(500).send('OAuth failed');
   }
 });
 
 app.get('/auth/success', (req, res) => {
-  // Простая страница, которая сохранит токен в localStorage и закроется/перенаправит
   const { token, skyid, login } = req.query;
   res.send(`
-    <html><body><script>
-      localStorage.setItem('skyvideo_token', '${token}');
-      localStorage.setItem('skyvideo_skyid', '${skyid}');
-      localStorage.setItem('skyvideo_login', '${login}');
-      window.location.href = '/'; // или на главную SkyVideo
-    </script></body></html>
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="UTF-8"><title>Успешный вход</title></head>
+    <body>
+      <script>
+        localStorage.setItem('skyvideo_token', '${token}');
+        localStorage.setItem('skyvideo_skyid', '${skyid}');
+        localStorage.setItem('skyvideo_login', '${login}');
+        window.location.href = '/';
+      </script>
+    </body>
+    </html>
   `);
 });
 
