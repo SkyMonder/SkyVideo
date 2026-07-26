@@ -230,8 +230,7 @@ function authMiddleware(req, res, next) {
 }
 
 // ====== Middleware для админ-панели (отдельная авторизация) ======
-// Хранилище сессий админки (в памяти)
-const adminSessions = new Map(); // token -> { created, expires }
+const adminSessions = new Map();
 
 function generateAdminToken() {
   return crypto.randomBytes(32).toString('hex');
@@ -247,7 +246,6 @@ function adminAuthMiddleware(req, res, next) {
     adminSessions.delete(auth);
     return res.status(401).json({ error: 'Session expired or invalid' });
   }
-  // продлеваем сессию на 1 час
   session.expires = Date.now() + 3600000;
   next();
 }
@@ -601,20 +599,17 @@ app.get('/follow/check/:skyid', authMiddleware, (req, res) => {
   res.json({ isFollowing: follows.following.includes(targetSkyid) });
 });
 
-// ====== АДМИН-ПАНЕЛЬ С ОТДЕЛЬНЫМ ВХОДОМ ======
-
-// Эндпоинт для входа в админку
+// ====== АДМИН-ПАНЕЛЬ ======
 app.post('/admin/login', (req, res) => {
   const { login, password } = req.body;
   if (login === ADMIN_PANEL_USER && password === ADMIN_PANEL_PASS) {
     const token = generateAdminToken();
-    adminSessions.set(token, { created: Date.now(), expires: Date.now() + 3600000 }); // 1 час
+    adminSessions.set(token, { created: Date.now(), expires: Date.now() + 3600000 });
     return res.json({ ok: true, token });
   }
   return res.status(401).json({ error: 'Неверные учётные данные' });
 });
 
-// Страница админ-панели (открытая, но внутри проверяем токен)
 app.get('/admin/panel', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -672,17 +667,17 @@ app.get('/admin/panel', (req, res) => {
         </div>
       </div>
       <script>
-        const API_BASE = '${req.protocol}://${req.get('host')}';
+        // Используем относительные URL (без указания протокола и хоста)
+        const API_BASE = '';
+
         let adminToken = localStorage.getItem('admin_token') || '';
 
-        // Проверяем токен при загрузке
         function checkAuth() {
           if (!adminToken) {
             document.getElementById('login-form').style.display = 'block';
             document.getElementById('admin-content').style.display = 'none';
             return;
           }
-          // Проверяем токен, делая запрос к защищённому API
           fetch(API_BASE + '/admin/videos', {
             headers: { 'Authorization': 'Bearer ' + adminToken }
           })
@@ -834,7 +829,6 @@ app.get('/admin/panel', (req, res) => {
           loadBanned();
         };
 
-        // Запускаем проверку при загрузке
         checkAuth();
       </script>
     </body>
@@ -842,7 +836,7 @@ app.get('/admin/panel', (req, res) => {
   `);
 });
 
-// ====== Админ-эндпоинты (защищены через adminAuthMiddleware) ======
+// ====== Админ-эндпоинты ======
 app.get('/admin/videos', adminAuthMiddleware, (req, res) => {
   const ids = dbList('videos');
   const videos = ids.map(id => dbGet('videos', id)).filter(Boolean).sort((a,b) => b.created - a.created);
