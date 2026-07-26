@@ -269,16 +269,16 @@ async function processVideoInBackground(videoId, originalPath) {
       const ffmpegArgs = [
         '-i', originalPath,
         '-c:v', 'libx264',
-        '-b:v', quality.bitrate,
-        '-maxrate', quality.maxrate,
-        '-bufsize', quality.bufsize,
-        '-preset', 'veryfast',
+        '-b:v', '800k',           // снижаем битрейт до 800k
+        '-maxrate', '800k',
+        '-bufsize', '1600k',
+        '-preset', 'ultrafast',   // вместо veryfast (быстрее на 30-50%)
         '-profile:v', 'high',
-        '-vf', `scale=trunc(${quality.width}/2)*2:trunc(${quality.height}/2)*2`,
+        '-vf', 'scale=854:480',   // только одно качество 480p (отключаем 720p)
         '-c:a', 'aac',
-        '-b:a', '128k',
+        '-b:a', '96k',            // снижаем аудио битрейт
         '-f', 'hls',
-        '-hls_time', '6',
+        '-hls_time', '10',        // увеличиваем сегменты до 10 секунд (меньше файлов)
         '-hls_playlist_type', 'vod',
         '-hls_segment_filename', segmentPattern,
         playlistPath
