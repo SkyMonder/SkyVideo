@@ -7,6 +7,8 @@ const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
 const { spawn } = require('child_process');
+// Импортируем pipeline из @xenova/transformers
+const { pipeline } = require('@xenova/transformers');
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
@@ -70,32 +72,121 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-// ====== Настройки ИИ-модерации ======
-const AI_API_URL = 'https://api-inference.huggingface.co/models/unitary/toxic-bert';
-const AI_API_KEY = process.env.HF_API_KEY; // Получите ключ на huggingface.co
-const TOXICITY_THRESHOLD = 0.8;
+// ====== Локальный список запрещённых слов (расширенный) ======
+const BAD_WORDS = [
+  // ===== БАЗОВЫЕ МАТЕРНЫЕ КОРНИ (ОБСЦЕННАЯ ЛЕКСИКА) =====
+  // Ядро русского мата, от которых образуются сотни производных[reference:3]
+  'хуй', 'пизда', 'блядь', 'еб', 'ёб',
+
+  // ===== ПРОИЗВОДНЫЕ ОТ КОРНЕЙ (САМЫЕ РАСПРОСТРАНЕННЫЕ) =====
+  // От "хуй"
+  'хуйло', 'хуесос', 'хуила', 'хуйня', 'охуел', 'охуеть', 'нахуй', 'похуй', 'хуже',
+  // От "пизда"
+  'пиздец', 'пиздюк', 'пиздеть', 'пиздатый', 'пиздануть', 'распиздяй',
+  // От "блядь"
+  'бля', 'блять', 'блядство', 'блядун', 'блядюга',
+  // От "еб/ёб"
+  'ебать', 'ебаться', 'ебанутый', 'еблан', 'ёбаный', 'заебал', 'заебать', 'выебон',
+
+  // ===== ДРУГИЕ ГРУБЫЕ И ОСКОРБИТЕЛЬНЫЕ СЛОВА =====
+  // Оскорбления
+  'мудак', 'мудила', 'гандон', 'гондон', 'пидор', 'пидарас', 'педераст',
+  'сука', 'стерва', 'тварь', 'скотина', 'сволочь', 'падла', 'шалава',
+  'шлюха', 'курва', 'проститутка', 'бомж', 'лох', 'редиска', 'козел',
+  'баран', 'осел', 'свинья', 'гад', 'гадина', 'змей', 'идиот', 'дебил',
+  'даун', 'олень', 'индюк', 'петух', 'залупа', 'манда', 'писька',
+
+  // ===== СЛОВА ИЗ СТОП-ЛИСТОВ РОСКОМНАДЗОРА =====
+  // Корни, упомянутые в официальных списках[reference:4]
+  'бзд', 'бздеть', 'елд', 'говн', 'говно', 'говнять',
+  'жоп', 'жопа', 'манд', 'манда', 'муд', 'муди',
+  'перд', 'пердеть', 'пердун', 'сра', 'срать', 'срань',
+  'сса', 'ссать', 'шлюх', 'шлюха',
+
+  // ===== НАРКОТИКИ, ПСИХОАКТИВНЫЕ ВЕЩЕСТВА =====
+  'наркота', 'наркотик', 'анаша', 'марихуана', 'травка', 'шишки',
+  'спайс', 'соль', 'меф', 'мефедрон', 'кокаин', 'героин',
+  'экстази', 'амфетамин', 'метамфетамин', 'лсд', 'психоделик',
+  'дурман', 'дурь', 'химия', 'синтетика', 'закладка', 'клад',
+
+  // ===== НЕЗАКОННЫЕ ТОВАРЫ И УСЛУГИ =====
+  'электроудочка', 'электрофишер', 'гадание', 'эскорт', 'интим',
+  'оружие', 'пистолет', 'автомат', 'боеприпас', 'патрон',
+  'взрывчатка', 'динамит', 'кредит', 'займ', 'долг',
+
+  // ===== МОШЕННИЧЕСТВО И СПАМ =====
+  'развод', 'кидалово', 'кинуть', 'лохотрон', 'халява',
+  'скам', 'scam', 'фишинг', 'phishing', 'spam',
+  'взлом', 'взломать', 'хакинг', 'hacking', 'кряк', 'крякнутый',
+
+  // ===== ПОРНОГРАФИЯ И СЕКСУАЛЬНЫЙ КОНТЕНТ =====
+  'порно', 'porn', 'секс', 'sex', 'голый', 'обнаженный',
+  'сосет', 'минет', 'орал', 'групповушка', 'вибратор',
+
+  // ===== ЭКСТРЕМИЗМ, РАСИЗМ, КСЕНОФОБИЯ =====
+  'фашист', 'нацист', 'скинхед', 'черножопый', 'жид', 'хохол',
+  'москаль', 'чурка', 'хач', 'урод', 'дегенерат',
+
+  // ===== ОБХОДНЫЕ ВАРИАНТЫ (ТРАНСЛИТ, ЗАМЕНА БУКВ) =====
+  // Транслит
+  'xui', 'pizda', 'blyat', 'suka', 'pidor', 'pidaras',
+  'ebat', 'ebal', 'zabral', 'nahui',
+
+  // С заменой "а" на "о" и наоборот
+  'хyй', 'пиздо', 'бльоть', 'суко', 'мудо',
+
+  // С заменой "е" на "ё"
+  'ебё', 'пиздёж',
+
+  // Английские аналоги
+  'fuck', 'shit', 'ass', 'bitch', 'cunt', 'dick', 'pussy',
+  'bastard', 'whore', 'slut', 'nigger', 'faggot', 'retard'
+];
+
+function containsBadWords(text) {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  return BAD_WORDS.some(word => lower.includes(word));
+}
+
+// ====== ИИ-модерация с помощью модели Nelera/ru-toxicity-detection ======
+let classifier = null;
+
+async function loadClassifier() {
+  if (!classifier) {
+    console.log('🔄 Загрузка модели ru-toxicity-detection...');
+    try {
+      classifier = await pipeline(
+        'text-classification',
+        'Nelera/ru-toxicity-detection'
+      );
+      console.log('✅ Модель ru-toxicity-detection загружена!');
+    } catch (err) {
+      console.error('❌ Ошибка загрузки модели:', err);
+    }
+  }
+  return classifier;
+}
+// Загружаем модель при старте
+loadClassifier();
 
 async function checkAI(text) {
-  if (!AI_API_KEY) {
-    console.warn('⚠️ HF_API_KEY не задан, ИИ-модерация отключена');
-    return { toxic: false, score: 0 };
+  // Если модель ещё не загружена, используем локальный список
+  if (!classifier) {
+    console.warn('⚠️ Модель не загружена, используем локальный список');
+    return { toxic: containsBadWords(text), score: containsBadWords(text) ? 1 : 0 };
   }
   try {
-    const response = await axios.post(
-      AI_API_URL,
-      { inputs: text },
-      {
-        headers: { Authorization: `Bearer ${AI_API_KEY}` },
-        timeout: 5000,
-      }
-    );
-    const results = response.data[0] || [];
-    const toxic = results.find(r => r.label === 'toxic');
-    const score = toxic ? toxic.score : 0;
-    return { toxic: score >= TOXICITY_THRESHOLD, score };
-  } catch (e) {
-    console.error('❌ Ошибка ИИ-модерации:', e.message);
-    return { toxic: false, score: 0 };
+    const result = await classifier(text);
+    // Результат: [{ label: 'LABEL_1' (toxic) или 'LABEL_0' (neutral), score: 0.99 }]
+    const isToxic = result[0].label === 'LABEL_1';
+    const score = result[0].score;
+    // Комбинируем с локальным списком
+    const localResult = containsBadWords(text);
+    return { toxic: isToxic || localResult, score: Math.max(score, localResult ? 1 : 0) };
+  } catch (err) {
+    console.error('❌ Ошибка ИИ-модерации:', err.message);
+    return { toxic: containsBadWords(text), score: containsBadWords(text) ? 1 : 0 };
   }
 }
 
@@ -262,10 +353,9 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
     const videoId = 'vid_' + Date.now();
     const videoPath = file.path;
     const { title, description, tags } = req.body;
-    // Исправление: безопасно преобразуем tags в массив
     const tagArray = tags ? tags.split(',').map(t => t.trim()).filter(Boolean) : [];
 
-    // ИИ-модерация (используем tagArray)
+    // Проверка через ИИ (с fallback на локальный список)
     const fullText = title + ' ' + description + ' ' + tagArray.join(' ');
     const aiResult = await checkAI(fullText);
     if (aiResult.toxic) {
@@ -413,6 +503,7 @@ app.post('/video/:id/comment', authMiddleware, async (req, res) => {
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: 'Text required' });
 
+  // Проверка через ИИ (с fallback на локальный список)
   const aiResult = await checkAI(text);
   if (aiResult.toxic) {
     banUserWithDuration(req.user.skyid, 'Токсичный комментарий');
@@ -699,7 +790,7 @@ app.get('/admin/banned', authMiddleware, adminMiddleware, (req, res) => {
   res.json(active);
 });
 
-// ====== Список видео (защищённый от ошибок) ======
+// ====== Список видео ======
 app.get('/list', (req, res) => {
   try {
     const ids = dbList('videos');
@@ -739,5 +830,6 @@ server.headersTimeout = 60 * 60 * 1000;
 
 server.listen(PORT, () => {
   console.log(`🚀 SkyVideo running on port ${PORT}`);
-  console.log(`🤖 ИИ-модерация ${AI_API_KEY ? 'активна' : 'отключена (нет ключа)'}`);
+  console.log(`🤖 Модель ru-toxicity-detection будет загружена при первом запросе`);
+  console.log(`📋 Локальный список слов содержит ${BAD_WORDS.length} записей`);
 });
