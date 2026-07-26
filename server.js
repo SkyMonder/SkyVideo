@@ -7,8 +7,6 @@ const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
 const { spawn } = require('child_process');
-// Импортируем pipeline из @xenova/transformers
-const { pipeline } = require('@xenova/transformers');
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
@@ -72,7 +70,7 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-// ====== Локальный список запрещённых слов (расширенный) ======
+// ====== Локальный список запрещённых слов ======
 const BAD_WORDS = [
   // ===== БАЗОВЫЕ МАТЕРНЫЕ КОРНИ (ОБСЦЕННАЯ ЛЕКСИКА) =====
   // Ядро русского мата, от которых образуются сотни производных[reference:3]
@@ -149,43 +147,36 @@ function containsBadWords(text) {
   return BAD_WORDS.some(word => lower.includes(word));
 }
 
-// ====== ИИ-модерация с помощью модели Nelera/ru-toxicity-detection ======
-let classifier = null;
-
-async function loadClassifier() {
-  if (!classifier) {
-    console.log('🔄 Загрузка модели ru-toxicity-detection...');
-    try {
-      classifier = await pipeline(
-        'text-classification',
-        'Nelera/ru-toxicity-detection'
-      );
-      console.log('✅ Модель ru-toxicity-detection загружена!');
-    } catch (err) {
-      console.error('❌ Ошибка загрузки модели:', err);
-    }
-  }
-  return classifier;
-}
-// Загружаем модель при старте
-loadClassifier();
+// ====== ИИ-модерация через Hugging Face Inference API ======
+const AI_API_URL = 'https://api-inference.huggingface.co/models/Nelera/ru-toxicity-detection';
+const AI_API_KEY = process.env.HF_API_KEY; // Бесплатный ключ на huggingface.co/settings/tokens
+const TOXICITY_THRESHOLD = 0.8;
 
 async function checkAI(text) {
-  // Если модель ещё не загружена, используем локальный список
-  if (!classifier) {
-    console.warn('⚠️ Модель не загружена, используем локальный список');
+  // Если нет ключа, сразу проверяем по локальному списку
+  if (!AI_API_KEY) {
+    console.warn('⚠️ HF_API_KEY не задан, используем локальный список слов');
     return { toxic: containsBadWords(text), score: containsBadWords(text) ? 1 : 0 };
   }
   try {
-    const result = await classifier(text);
-    // Результат: [{ label: 'LABEL_1' (toxic) или 'LABEL_0' (neutral), score: 0.99 }]
-    const isToxic = result[0].label === 'LABEL_1';
-    const score = result[0].score;
+    const response = await axios.post(
+      AI_API_URL,
+      { inputs: text },
+      {
+        headers: { Authorization: `Bearer ${AI_API_KEY}` },
+        timeout: 5000,
+      }
+    );
+    // Модель возвращает массив: [ { label: 'LABEL_1' or 'LABEL_0', score: 0.99 } ]
+    const result = response.data[0] || {};
+    const isToxic = result.label === 'LABEL_1';
+    const score = result.score || 0;
     // Комбинируем с локальным списком
     const localResult = containsBadWords(text);
     return { toxic: isToxic || localResult, score: Math.max(score, localResult ? 1 : 0) };
-  } catch (err) {
-    console.error('❌ Ошибка ИИ-модерации:', err.message);
+  } catch (e) {
+    console.error('❌ Ошибка ИИ-модерации:', e.message);
+    // При ошибке используем локальный список
     return { toxic: containsBadWords(text), score: containsBadWords(text) ? 1 : 0 };
   }
 }
@@ -830,6 +821,6 @@ server.headersTimeout = 60 * 60 * 1000;
 
 server.listen(PORT, () => {
   console.log(`🚀 SkyVideo running on port ${PORT}`);
-  console.log(`🤖 Модель ru-toxicity-detection будет загружена при первом запросе`);
+  console.log(`🤖 ИИ-модерация с моделью Nelera/ru-toxicity-detection (${AI_API_KEY ? 'активна' : 'отключена (нет ключа)'})`);
   console.log(`📋 Локальный список слов содержит ${BAD_WORDS.length} записей`);
 });
