@@ -17,6 +17,10 @@ const PORT = process.env.PORT || 3000;
 const SKYID_URL = process.env.SKYID_URL || 'https://skymutant.onrender.com';
 const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'SkyMonder';
 
+// ====== Переменные для админ-панели ======
+const ADMIN_PANEL_USER = process.env.ADMIN_PANEL_USER;
+const ADMIN_PANEL_PASS = process.env.ADMIN_PANEL_PASS;
+
 // ====== Директории ======
 const DATA_DIR = path.join(__dirname, 'data');
 const VIDEO_DIR = path.join(__dirname, 'videos');
@@ -225,10 +229,26 @@ function authMiddleware(req, res, next) {
   }).catch(() => res.status(401).json({ error: 'Invalid token' }));
 }
 
-function adminMiddleware(req, res, next) {
-  if (!req.user || !req.isAdmin) {
-    return res.status(403).json({ error: 'Forbidden. Только для администратора.' });
+// ====== Middleware для админ-панели (отдельная авторизация) ======
+// Хранилище сессий админки (в памяти)
+const adminSessions = new Map(); // token -> { created, expires }
+
+function generateAdminToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function adminAuthMiddleware(req, res, next) {
+  const auth = req.headers.authorization?.replace('Bearer ', '');
+  if (!auth) {
+    return res.status(401).json({ error: 'Unauthorized' });
   }
+  const session = adminSessions.get(auth);
+  if (!session || Date.now() > session.expires) {
+    adminSessions.delete(auth);
+    return res.status(401).json({ error: 'Session expired or invalid' });
+  }
+  // продлеваем сессию на 1 час
+  session.expires = Date.now() + 3600000;
   next();
 }
 
@@ -581,8 +601,20 @@ app.get('/follow/check/:skyid', authMiddleware, (req, res) => {
   res.json({ isFollowing: follows.following.includes(targetSkyid) });
 });
 
-// ====== АДМИН-ПАНЕЛЬ (открытая страница, но защищённые API) ======
-// Отдаём HTML без проверки токена — клиентский скрипт сам проверит токен
+// ====== АДМИН-ПАНЕЛЬ С ОТДЕЛЬНЫМ ВХОДОМ ======
+
+// Эндпоинт для входа в админку
+app.post('/admin/login', (req, res) => {
+  const { login, password } = req.body;
+  if (login === ADMIN_PANEL_USER && password === ADMIN_PANEL_PASS) {
+    const token = generateAdminToken();
+    adminSessions.set(token, { created: Date.now(), expires: Date.now() + 3600000 }); // 1 час
+    return res.json({ ok: true, token });
+  }
+  return res.status(401).json({ error: 'Неверные учётные данные' });
+});
+
+// Страница админ-панели (открытая, но внутри проверяем токен)
 app.get('/admin/panel', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -601,39 +633,119 @@ app.get('/admin/panel', (req, res) => {
         .item .actions { display: flex; gap: 8px; }
         input, textarea { background: #0d1225; border: 1px solid #3a4660; color: white; padding: 6px; border-radius: 6px; width: 100%; margin-bottom: 8px; }
         .error-message { color: #f48024; text-align: center; margin-top: 20px; }
+        .login-form { max-width: 400px; margin: 0 auto; }
+        .login-form input { width: 100%; padding: 10px; margin-bottom: 10px; }
+        .login-form button { width: 100%; }
+        .hidden { display: none; }
       </style>
     </head>
     <body>
       <h1>🛡️ Админ-панель SkyVideo</h1>
-      <div id="app"></div>
+      <div id="app">
+        <div id="login-form" class="login-form">
+          <h2>Вход в админ-панель</h2>
+          <input type="text" id="admin-login" placeholder="Логин">
+          <input type="password" id="admin-password" placeholder="Пароль">
+          <button onclick="login()">Войти</button>
+          <div id="login-error" style="color:#c44; margin-top:10px;"></div>
+        </div>
+        <div id="admin-content" class="hidden">
+          <div class="admin-section">
+            <h2>📹 Все видео</h2>
+            <div id="video-list">Загрузка...</div>
+          </div>
+          <div class="admin-section">
+            <h2>💬 Все комментарии</h2>
+            <div id="comments-list">Загрузка...</div>
+          </div>
+          <div class="admin-section">
+            <h2>🚫 Бан пользователей</h2>
+            <input type="text" id="ban-skyid" placeholder="SkyID пользователя">
+            <button onclick="banUser()">Забанить (2 дня)</button>
+            <button onclick="unbanUser()" class="btn-danger">Разбанить</button>
+            <div id="ban-result"></div>
+          </div>
+          <div class="admin-section">
+            <h2>🔒 Забаненные (срок)</h2>
+            <div id="banned-list">Загрузка...</div>
+          </div>
+        </div>
+      </div>
       <script>
         const API_BASE = '${req.protocol}://${req.get('host')}';
-        const token = localStorage.getItem('skyvideo_token');
-        if (!token) {
-          document.getElementById('app').innerHTML = \`
-            <div class="error-message">
-              <h2>⛔ Не авторизован</h2>
-              <p>Для доступа к админ-панели необходимо войти в SkyVideo как администратор.</p>
-              <a href="/" style="color:#5f7ecf;">Вернуться на главную</a>
-            </div>
-          \`;
-          throw new Error('No token');
+        let adminToken = localStorage.getItem('admin_token') || '';
+
+        // Проверяем токен при загрузке
+        function checkAuth() {
+          if (!adminToken) {
+            document.getElementById('login-form').style.display = 'block';
+            document.getElementById('admin-content').style.display = 'none';
+            return;
+          }
+          // Проверяем токен, делая запрос к защищённому API
+          fetch(API_BASE + '/admin/videos', {
+            headers: { 'Authorization': 'Bearer ' + adminToken }
+          })
+          .then(res => {
+            if (res.ok) {
+              document.getElementById('login-form').style.display = 'none';
+              document.getElementById('admin-content').style.display = 'block';
+              loadVideos();
+              loadComments();
+              loadBanned();
+            } else {
+              localStorage.removeItem('admin_token');
+              adminToken = '';
+              document.getElementById('login-form').style.display = 'block';
+              document.getElementById('admin-content').style.display = 'none';
+            }
+          })
+          .catch(() => {
+            localStorage.removeItem('admin_token');
+            adminToken = '';
+            document.getElementById('login-form').style.display = 'block';
+            document.getElementById('admin-content').style.display = 'none';
+          });
+        }
+
+        async function login() {
+          const login = document.getElementById('admin-login').value.trim();
+          const password = document.getElementById('admin-password').value.trim();
+          if (!login || !password) {
+            document.getElementById('login-error').textContent = 'Заполните все поля';
+            return;
+          }
+          try {
+            const res = await fetch(API_BASE + '/admin/login', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ login, password })
+            });
+            const data = await res.json();
+            if (res.ok) {
+              localStorage.setItem('admin_token', data.token);
+              adminToken = data.token;
+              document.getElementById('login-error').textContent = '';
+              checkAuth();
+            } else {
+              document.getElementById('login-error').textContent = data.error || 'Ошибка входа';
+            }
+          } catch (e) {
+            document.getElementById('login-error').textContent = 'Ошибка соединения';
+          }
         }
 
         async function apiFetch(url, options = {}) {
           const headers = { 'Content-Type': 'application/json' };
-          if (token) headers['Authorization'] = 'Bearer ' + token;
+          if (adminToken) headers['Authorization'] = 'Bearer ' + adminToken;
           const res = await fetch(API_BASE + url, { ...options, headers });
           if (!res.ok) {
-            if (res.status === 401 || res.status === 403) {
-              document.getElementById('app').innerHTML = \`
-                <div class="error-message">
-                  <h2>⛔ Доступ запрещён</h2>
-                  <p>У вас нет прав администратора. Войдите как SkyMonder.</p>
-                  <a href="/" style="color:#5f7ecf;">Вернуться на главную</a>
-                </div>
-              \`;
-              throw new Error('Forbidden');
+            if (res.status === 401) {
+              localStorage.removeItem('admin_token');
+              adminToken = '';
+              document.getElementById('login-form').style.display = 'block';
+              document.getElementById('admin-content').style.display = 'none';
+              throw new Error('Unauthorized');
             }
             throw new Error(await res.text());
           }
@@ -722,46 +834,22 @@ app.get('/admin/panel', (req, res) => {
           loadBanned();
         };
 
-        // Рендерим админку
-        document.getElementById('app').innerHTML = \`
-          <div class="admin-section">
-            <h2>📹 Все видео</h2>
-            <div id="video-list">Загрузка...</div>
-          </div>
-          <div class="admin-section">
-            <h2>💬 Все комментарии</h2>
-            <div id="comments-list">Загрузка...</div>
-          </div>
-          <div class="admin-section">
-            <h2>🚫 Бан пользователей</h2>
-            <input type="text" id="ban-skyid" placeholder="SkyID пользователя">
-            <button onclick="banUser()">Забанить (2 дня)</button>
-            <button onclick="unbanUser()" class="btn-danger">Разбанить</button>
-            <div id="ban-result"></div>
-          </div>
-          <div class="admin-section">
-            <h2>🔒 Забаненные (срок)</h2>
-            <div id="banned-list">Загрузка...</div>
-          </div>
-        \`;
-
-        loadVideos();
-        loadComments();
-        loadBanned();
+        // Запускаем проверку при загрузке
+        checkAuth();
       </script>
     </body>
     </html>
   `);
 });
 
-// ====== Админ-эндпоинты (защищены) ======
-app.get('/admin/videos', authMiddleware, adminMiddleware, (req, res) => {
+// ====== Админ-эндпоинты (защищены через adminAuthMiddleware) ======
+app.get('/admin/videos', adminAuthMiddleware, (req, res) => {
   const ids = dbList('videos');
   const videos = ids.map(id => dbGet('videos', id)).filter(Boolean).sort((a,b) => b.created - a.created);
   res.json(videos);
 });
 
-app.delete('/admin/video/:videoId', authMiddleware, adminMiddleware, (req, res) => {
+app.delete('/admin/video/:videoId', adminAuthMiddleware, (req, res) => {
   const meta = dbGet('videos', req.params.videoId);
   if (!meta) return res.status(404).json({ error: 'Not found' });
   const videoPath = path.join(VIDEO_DIR, meta.filename);
@@ -772,7 +860,7 @@ app.delete('/admin/video/:videoId', authMiddleware, adminMiddleware, (req, res) 
   res.json({ ok: true });
 });
 
-app.delete('/admin/comment/:videoId/:commentId', authMiddleware, adminMiddleware, (req, res) => {
+app.delete('/admin/comment/:videoId/:commentId', adminAuthMiddleware, (req, res) => {
   const meta = dbGet('videos', req.params.videoId);
   if (!meta) return res.status(404).json({ error: 'Video not found' });
   const comment = meta.comments.find(c => c.id === req.params.commentId);
@@ -782,20 +870,20 @@ app.delete('/admin/comment/:videoId/:commentId', authMiddleware, adminMiddleware
   res.json({ ok: true });
 });
 
-app.post('/admin/ban', authMiddleware, adminMiddleware, (req, res) => {
+app.post('/admin/ban', adminAuthMiddleware, (req, res) => {
   const { skyid } = req.body;
   if (!skyid) return res.status(400).json({ error: 'skyid required' });
   banUserWithDuration(skyid, 'Ручной бан (админ)', 2);
   res.json({ ok: true });
 });
 
-app.post('/admin/unban', authMiddleware, adminMiddleware, (req, res) => {
+app.post('/admin/unban', adminAuthMiddleware, (req, res) => {
   const { skyid } = req.body;
   dbDelete('bans', skyid);
   res.json({ ok: true });
 });
 
-app.get('/admin/banned', authMiddleware, adminMiddleware, (req, res) => {
+app.get('/admin/banned', adminAuthMiddleware, (req, res) => {
   const ids = dbList('bans');
   const banned = ids.map(id => dbGet('bans', id)).filter(Boolean);
   const active = banned.filter(b => !b.until || Date.now() < b.until);
@@ -844,4 +932,5 @@ server.listen(PORT, () => {
   console.log(`🚀 SkyVideo running on port ${PORT}`);
   console.log(`🤖 ИИ-модерация с моделью Nelera/ru-toxicity-detection (${AI_API_KEY ? 'активна' : 'отключена (нет ключа)'})`);
   console.log(`📋 Локальный список слов содержит ${BAD_WORDS.length} записей`);
+  console.log(`🔐 Админ-панель доступна по логину/паролю из переменных окружения`);
 });
