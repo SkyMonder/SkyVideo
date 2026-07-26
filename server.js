@@ -1,516 +1,361 @@
-const express = require('express');
-const http = require('http');
-const WebSocket = require('ws');
-const cors = require('cors');
-const axios = require('axios');
-const crypto = require('crypto');
-const path = require('path');
-const fs = require('fs');
-const multer = require('multer');
-const { spawn } = require('child_process');
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SkyVideo</title>
+  <style>
+    :root { --bg:#0a0f1e; --panel:#111827; --card:#1a233a; --border:#2a3450; --text:#e0e8ff; --accent:#5f7ecf; }
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { font-family:'Segoe UI',sans-serif; background:var(--bg); color:var(--text); height:100vh; display:flex; flex-direction:column; overflow:hidden; }
+    header { padding:1rem; background:var(--panel); border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; }
+    .logo { font-size:1.5rem; font-weight:700; }
+    .btn { background:var(--accent); border:none; color:white; padding:0.5rem 1rem; border-radius:8px; cursor:pointer; }
+    .btn-danger { background:#c44; }
+    .content { flex:1; overflow-y:auto; padding:1rem; }
+    .video-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:1rem; }
+    .video-card { background:var(--card); border-radius:12px; overflow:hidden; cursor:pointer; transition:transform .2s; }
+    .video-card:hover { transform:scale(1.02); }
+    .video-card .info { padding:0.8rem; }
+    .video-card .title { font-weight:600; margin-bottom:0.3rem; }
+    .video-card .meta { font-size:0.8rem; color:#8899cc; }
+    .modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.8); display:none; align-items:center; justify-content:center; z-index:50; }
+    .modal-overlay.active { display:flex; }
+    .modal { background:var(--card); border-radius:16px; padding:1.5rem; width:90%; max-width:800px; max-height:90vh; overflow-y:auto; border:1px solid var(--border); }
+    .modal input, .modal textarea { width:100%; padding:0.7rem; margin:0.5rem 0; background:#0d1225; border:1px solid var(--border); color:white; border-radius:8px; }
+    .comment-item { padding:0.5rem 0; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; }
+    .actions { display:flex; gap:0.5rem; align-items:center; }
+    .progress-bar { width:100%; height:20px; background:#1a233a; border-radius:10px; overflow:hidden; margin:10px 0; }
+    .progress-fill { height:100%; background:var(--accent); transition:width 0.3s; }
+    video { width:100%; max-height:500px; background:#000; border-radius:8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="logo">🎬 SkyVideo</div>
+    <div>
+      <span id="user-info"></span>
+      <button id="login-btn" class="btn">Войти</button>
+      <button id="upload-btn" class="btn" style="display:none;">📤 Загрузить</button>
+      <button id="profile-btn" class="btn" style="display:none;">👤</button>
+    </div>
+  </header>
+  <div class="content">
+    <div id="video-feed" class="video-grid"></div>
+  </div>
 
-const app = express();
+  <!-- Модалки -->
+  <div id="auth-modal" class="modal-overlay">
+    <div class="modal">
+      <h2 id="auth-title">Вход</h2>
+      <p style="color:#8899cc; margin-bottom:0.5rem;">Вы будете перенаправлены на SkyID для авторизации</p>
+      <button id="auth-submit" class="btn" style="width:100%;">Войти через SkyID</button>
+      <button class="btn" style="background:#444; width:100%; margin-top:0.5rem;" onclick="document.getElementById('auth-modal').classList.remove('active')">Отмена</button>
+      <div id="auth-error" style="color:#c44;margin-top:0.5rem;"></div>
+    </div>
+  </div>
 
-// ====== Увеличенные лимиты и таймауты ======
-app.use(cors({ origin: '*', methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+  <div id="upload-modal" class="modal-overlay">
+    <div class="modal">
+      <h2>Загрузить видео</h2>
+      <input type="text" id="vid-title" placeholder="Название">
+      <textarea id="vid-desc" placeholder="Описание"></textarea>
+      <input type="text" id="vid-tags" placeholder="Теги (через запятую)">
+      <input type="file" id="vid-file" accept="video/*">
+      <div class="progress-bar" id="upload-progress-bar" style="display:none;">
+        <div class="progress-fill" id="upload-progress-fill" style="width:0%;"></div>
+      </div>
+      <div id="upload-status" style="margin:5px 0; font-size:0.9rem; color:#8899cc;"></div>
+      <button id="vid-submit" class="btn">Загрузить</button>
+      <button class="btn" style="background:#444;" onclick="document.getElementById('upload-modal').classList.remove('active')">Отмена</button>
+    </div>
+  </div>
 
-const PORT = process.env.PORT || 3000;
-const SKYID_URL = process.env.SKYID_URL || 'https://skymutant.onrender.com';
-const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'SkyMonder';
+  <div id="player-modal" class="modal-overlay">
+    <div class="modal">
+      <button class="btn" style="float:right;background:#c44;" onclick="document.getElementById('player-modal').classList.remove('active')">✖</button>
+      <div id="player-container"></div>
+    </div>
+  </div>
 
-// Директории
-const DATA_DIR = path.join(__dirname, 'data');
-const VIDEO_DIR = path.join(__dirname, 'videos');
-const UPLOAD_TEMP = path.join(__dirname, 'uploads');
-const HLS_DIR = path.join(VIDEO_DIR, 'hls');
-[VIDEO_DIR, UPLOAD_TEMP, HLS_DIR, DATA_DIR].forEach(d => {
-  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
-});
+  <div id="profile-modal" class="modal-overlay">
+    <div class="modal">
+      <h2>Профиль канала</h2>
+      <input type="text" id="channel-name" placeholder="Имя канала">
+      <button id="save-profile" class="btn">Сохранить</button>
+      <button class="btn" style="background:#444;" onclick="document.getElementById('profile-modal').classList.remove('active')">Закрыть</button>
+    </div>
+  </div>
 
-// ====== Файловая БД ======
-function dbPut(bucket, key, data) {
-  const dir = path.join(DATA_DIR, bucket);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, key + '.json'), JSON.stringify(data));
-}
-function dbGet(bucket, key) {
-  const file = path.join(DATA_DIR, bucket, key + '.json');
-  if (!fs.existsSync(file)) return null;
-  try { return JSON.parse(fs.readFileSync(file, 'utf-8')); } catch (e) { return null; }
-}
-function dbList(bucket) {
-  const dir = path.join(DATA_DIR, bucket);
-  if (!fs.existsSync(dir)) return [];
-  return fs.readdirSync(dir).filter(f => f.endsWith('.json')).map(f => f.slice(0, -5));
-}
-function dbDelete(bucket, key) {
-  const file = path.join(DATA_DIR, bucket, key + '.json');
-  if (fs.existsSync(file)) fs.unlinkSync(file);
-}
+  <script>
+    // ====== Конфигурация ======
+    const SKYVIDEO_URL = 'https://skyvideo.onrender.com';
+    const SKYID_URL = 'https://skymutant.onrender.com';
+    const CLIENT_ID = 'skyvideo';
+    const REDIRECT_URI = 'https://skycitadel.onrender.com/callback.html';
 
-// ====== Multer с большими лимитами ======
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    // Убедимся, что папка существует
-    if (!fs.existsSync(UPLOAD_TEMP)) fs.mkdirSync(UPLOAD_TEMP, { recursive: true });
-    cb(null, UPLOAD_TEMP);
-  },
-  filename: (req, file, cb) => {
-    cb(null, Date.now() + '_' + Math.random().toString(36).slice(2,8) + path.extname(file.originalname));
-  }
-});
+    let token = localStorage.getItem('skyvideo_token') || null;
+    let currentUser = null;
 
-const upload = multer({
-  storage,
-  limits: {
-    fileSize: 500 * 1024 * 1024, // 500 МБ (максимум для Render)
-    fieldSize: 50 * 1024 * 1024,
-    parts: 100,
-    headerPairs: 2000
-  }
-});
-
-// Обработка ошибок multer
-app.use((err, req, res, next) => {
-  if (err instanceof multer.MulterError) {
-    if (err.code === 'LIMIT_FILE_SIZE') {
-      return res.status(413).json({ error: 'Файл слишком большой (максимум 500 МБ)' });
+    // ====== Авторизация ======
+    async function verifyToken() {
+      if (!token) return false;
+      try {
+        const res = await fetch(`${SKYID_URL}/me`, { headers: { Authorization: `Bearer ${token}` } });
+        if (res.ok) {
+          const me = await res.json();
+          const profileRes = await fetch(`${SKYVIDEO_URL}/profile`, { headers: { Authorization: `Bearer ${token}` } });
+          if (profileRes.ok) {
+            const profile = await profileRes.json();
+            currentUser = { login: me.login, name: profile.name || me.login };
+          } else {
+            currentUser = { login: me.login, name: me.login };
+          }
+          return true;
+        } else { logout(); return false; }
+      } catch (e) { logout(); return false; }
     }
-    return res.status(400).json({ error: err.message });
-  }
-  next(err);
-});
 
-// ====== Поиск FFmpeg ======
-function findBinary(name) {
-  const envVar = process.env[name.toUpperCase() + '_PATH'];
-  if (envVar && fs.existsSync(envVar)) return envVar;
-  const localPath = path.join(__dirname, 'bin', name);
-  if (fs.existsSync(localPath)) return localPath;
-  try {
-    const which = require('child_process').execSync(`which ${name}`, { encoding: 'utf8' }).trim();
-    if (which && fs.existsSync(which)) return which;
-  } catch (e) {}
-  return name;
-}
-const FFMPEG_PATH = findBinary('ffmpeg');
-const FFPROBE_PATH = findBinary('ffprobe');
-console.log(`🔧 FFmpeg: ${FFMPEG_PATH}`);
-console.log(`🔧 FFprobe: ${FFPROBE_PATH}`);
+    function loginWithSkyID() {
+      const scope = 'profile email';
+      const state = encodeURIComponent(window.location.href);
+      const authUrl = `${SKYID_URL}/oauth/authorize?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&scope=${encodeURIComponent(scope)}&state=${state}`;
+      window.location.href = authUrl;
+    }
 
-// ====== Проверка токена ======
-async function verifySkyToken(token) {
-  try {
-    const res = await axios.get(`${SKYID_URL}/me`, { headers: { Authorization: `Bearer ${token}` } });
-    return res.data;
-  } catch (e) { return null; }
-}
+    function logout() {
+      token = null;
+      localStorage.removeItem('skyvideo_token');
+      currentUser = null;
+      document.getElementById('user-info').textContent = '';
+      document.getElementById('login-btn').style.display = 'inline-block';
+      document.getElementById('upload-btn').style.display = 'none';
+      document.getElementById('profile-btn').style.display = 'none';
+      loadVideos();
+    }
 
-function authMiddleware(req, res, next) {
-  const auth = req.headers.authorization?.replace('Bearer ', '');
-  if (!auth) return res.status(401).json({ error: 'Unauthorized' });
-  verifySkyToken(auth).then(user => {
-    if (!user) return res.status(401).json({ error: 'Invalid token' });
-    req.user = user;
-    req.isAdmin = (user.login === ADMIN_LOGIN);
-    next();
-  }).catch(() => res.status(401).json({ error: 'Invalid token' }));
-}
+    function login(user) {
+      currentUser = user;
+      document.getElementById('user-info').textContent = user.name || user.login;
+      document.getElementById('login-btn').style.display = 'none';
+      document.getElementById('upload-btn').style.display = 'inline-block';
+      document.getElementById('profile-btn').style.display = 'inline-block';
+      loadVideos();
+    }
 
-// ====== Health ======
-app.get('/healthix', (req, res) => res.json({ status: 'ok', service: 'skyvideo' }));
+    // ====== Инициализация ======
+    (async () => {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('code')) {
+        window.location.href = '/callback.html' + window.location.search;
+        return;
+      }
+      if (token) {
+        const valid = await verifyToken();
+        if (valid && currentUser) { login(currentUser); return; }
+      }
+      document.getElementById('login-btn').style.display = 'inline-block';
+      loadVideos();
+    })();
 
-// ====== OAuth ======
-app.get('/auth/login', (req, res) => {
-  const clientId = 'skyvideo';
-  const scope = req.query.scope || 'profile email';
-  const host = req.headers.host || `localhost:${PORT}`;
-  const redirectUri = `https://${host}/auth/callback`;
-  const state = crypto.randomBytes(8).toString('hex');
-  const loginUrl = `${SKYID_URL}/oauth/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}&state=${state}`;
-  res.json({ loginUrl });
-});
-app.get('/auth/callback', async (req, res) => {
-  const { code } = req.query;
-  if (!code) return res.status(400).send('Missing code');
-  try {
-    const tokenRes = await axios.post(`${SKYID_URL}/oauth/token`, {
-      code,
-      client_id: 'skyvideo',
-      client_secret: 'skyvideo_secret'
+    document.getElementById('login-btn').addEventListener('click', () => {
+      document.getElementById('auth-modal').classList.add('active');
     });
-    const { access_token, skyid, login } = tokenRes.data;
-    res.redirect(`/auth/success?token=${access_token}&skyid=${skyid}&login=${login}`);
-  } catch (e) {
-    console.error('OAuth callback error:', e.response?.data || e);
-    res.status(500).send('OAuth failed');
-  }
-});
-app.get('/auth/success', (req, res) => {
-  const { token, skyid, login } = req.query;
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head><meta charset="UTF-8"><title>Успешный вход</title></head>
-    <body>
-      <script>
-        localStorage.setItem('skyvideo_token', '${token}');
-        localStorage.setItem('skyvideo_skyid', '${skyid}');
-        localStorage.setItem('skyvideo_login', '${login}');
-        window.location.href = '/';
-      </script>
-    </body>
-    </html>
-  `);
-});
+    document.getElementById('auth-submit').addEventListener('click', loginWithSkyID);
 
-// ====== Профиль ======
-app.get('/profile', authMiddleware, (req, res) => {
-  let profile = dbGet('profiles', req.user.skyid);
-  if (!profile) profile = { name: req.user.login, avatar: '' };
-  res.json(profile);
-});
-app.put('/profile', authMiddleware, (req, res) => {
-  const { name, avatar } = req.body;
-  const profile = { name: name || req.user.login, avatar: avatar || '' };
-  dbPut('profiles', req.user.skyid, profile);
-  res.json(profile);
-});
-
-// ====== Конфигурация качества (оптимизирована для скорости) ======
-const QUALITY_CONFIGS = [
-  { label: '720p', width: 1280, height: 720, bitrate: '1500k', maxrate: '1500k', bufsize: '3000k' },
-  { label: '480p', width: 854, height: 480, bitrate: '800k', maxrate: '800k', bufsize: '1600k' }
-];
-
-// ====== Загрузка видео (асинхронная) ======
-app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => {
-  try {
-    const file = req.file;
-    if (!file) return res.status(400).json({ error: 'No video file' });
-    const videoId = 'vid_' + Date.now();
-    const originalPath = file.path;
-    const { title, description, tags } = req.body;
-    const tagArray = tags ? tags.split(',').map(t => t.trim()).filter(Boolean) : [];
-
-    // Сразу сохраняем метаданные со статусом "processing"
-    const meta = {
-      id: videoId,
-      title: title || 'Без названия',
-      description: description || '',
-      tags: tagArray,
-      author: req.user.login,
-      skyid: req.user.skyid,
-      created: Date.now(),
-      status: 'processing',
-      likes: [],
-      dislikes: [],
-      views: 0,
-      comments: [],
-      hlsMaster: null,
-      qualities: []
-    };
-    dbPut('videos', videoId, meta);
-
-    // Возвращаем ответ немедленно
-    res.json({ ok: true, videoId, status: 'processing' });
-
-    // Запускаем фоновую конвертацию (не ждём)
-    processVideoInBackground(videoId, originalPath);
-  } catch (e) {
-    console.error('Upload error:', e);
-    // Если ошибка, удаляем загруженный файл, если он есть
-    if (req.file && req.file.path && fs.existsSync(req.file.path)) {
-      fs.unlinkSync(req.file.path);
-    }
-    res.status(500).json({ error: 'Upload failed: ' + e.message });
-  }
-});
-
-// ====== Фоновая обработка ======
-async function processVideoInBackground(videoId, originalPath) {
-  try {
-    const meta = dbGet('videos', videoId);
-    if (!meta) throw new Error('Video not found');
-
-    const hlsVideoDir = path.join(HLS_DIR, videoId);
-    if (!fs.existsSync(hlsVideoDir)) fs.mkdirSync(hlsVideoDir, { recursive: true });
-
-    // Получаем разрешение
-    let videoWidth = 1920, videoHeight = 1080;
-    try {
-      const probe = spawn(FFPROBE_PATH, ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', originalPath]);
-      const output = await new Promise((resolve, reject) => {
-        let data = '';
-        probe.stdout.on('data', chunk => data += chunk);
-        probe.stderr.on('data', chunk => console.error(chunk.toString()));
-        probe.on('close', code => code === 0 ? resolve(data) : reject(new Error('ffprobe failed')));
-      });
-      const [w, h] = output.trim().split(',').map(Number);
-      if (w && h) { videoWidth = w; videoHeight = h; }
-    } catch (e) { console.warn('Could not probe video, using default 1080p'); }
-
-    // Фильтруем качества
-    const validQualities = QUALITY_CONFIGS.filter(q => q.width <= videoWidth && q.height <= videoHeight);
-    if (validQualities.length === 0) {
-      validQualities.push({ label: 'original', width: videoWidth, height: videoHeight, bitrate: '1500k', maxrate: '1500k', bufsize: '3000k' });
-    }
-
-    const variantStreams = [];
-    for (const quality of validQualities) {
-      const qualityDir = path.join(hlsVideoDir, quality.label);
-      if (!fs.existsSync(qualityDir)) fs.mkdirSync(qualityDir, { recursive: true });
-
-      const playlistPath = path.join(qualityDir, 'playlist.m3u8');
-      const segmentPattern = path.join(qualityDir, 'segment_%03d.ts');
-
-      const ffmpegArgs = [
-        '-i', originalPath,
-        '-c:v', 'libx264',
-        '-b:v', '800k',           // снижаем битрейт до 800k
-        '-maxrate', '800k',
-        '-bufsize', '1600k',
-        '-preset', 'ultrafast',   // вместо veryfast (быстрее на 30-50%)
-        '-profile:v', 'high',
-        '-vf', 'scale=854:480',   // только одно качество 480p (отключаем 720p)
-        '-c:a', 'aac',
-        '-b:a', '96k',            // снижаем аудио битрейт
-        '-f', 'hls',
-        '-hls_time', '10',        // увеличиваем сегменты до 10 секунд (меньше файлов)
-        '-hls_playlist_type', 'vod',
-        '-hls_segment_filename', segmentPattern,
-        playlistPath
-      ];
-
-      await new Promise((resolve, reject) => {
-        const ff = spawn(FFMPEG_PATH, ffmpegArgs);
-        let stderr = '';
-        ff.stderr.on('data', d => { stderr += d.toString(); console.log(d.toString()); });
-        ff.on('close', code => {
-          if (code === 0) resolve();
-          else reject(new Error(`FFmpeg for ${quality.label} failed with code ${code}: ${stderr}`));
+    // ====== Профиль ======
+    document.getElementById('profile-btn').addEventListener('click', async () => {
+      try {
+        const res = await fetch(`${SKYVIDEO_URL}/profile`, { headers: { Authorization: `Bearer ${token}` } });
+        const profile = await res.json();
+        document.getElementById('channel-name').value = profile.name || '';
+        document.getElementById('profile-modal').classList.add('active');
+      } catch (e) {}
+    });
+    document.getElementById('save-profile').addEventListener('click', async () => {
+      const name = document.getElementById('channel-name').value.trim();
+      try {
+        await fetch(`${SKYVIDEO_URL}/profile`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ name })
         });
-        ff.on('error', reject);
+        document.getElementById('profile-modal').classList.remove('active');
+        if (currentUser) { currentUser.name = name; document.getElementById('user-info').textContent = name; }
+      } catch (e) {}
+    });
+
+    // ====== Загрузка видео ======
+    document.getElementById('upload-btn').addEventListener('click', () => {
+      document.getElementById('upload-modal').classList.add('active');
+    });
+
+    document.getElementById('vid-submit').addEventListener('click', async () => {
+      const title = document.getElementById('vid-title').value.trim();
+      const desc = document.getElementById('vid-desc').value.trim();
+      const tags = document.getElementById('vid-tags').value.trim();
+      const file = document.getElementById('vid-file').files[0];
+      if (!title || !file) return alert('Название и файл обязательны');
+
+      const formData = new FormData();
+      formData.append('title', title);
+      formData.append('description', desc);
+      formData.append('tags', tags);
+      formData.append('video', file);
+
+      const progressBar = document.getElementById('upload-progress-bar');
+      const progressFill = document.getElementById('upload-progress-fill');
+      const statusDiv = document.getElementById('upload-status');
+      progressBar.style.display = 'block';
+      progressFill.style.width = '0%';
+      statusDiv.textContent = 'Загрузка...';
+
+      try {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', `${SKYVIDEO_URL}/upload`, true);
+        xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) {
+            const percent = Math.round((e.loaded / e.total) * 100);
+            progressFill.style.width = percent + '%';
+            statusDiv.textContent = `Загрузка: ${percent}%`;
+          }
+        };
+        const promise = new Promise((resolve, reject) => {
+          xhr.onload = () => {
+            if (xhr.status === 200) {
+              try { resolve(JSON.parse(xhr.responseText)); }
+              catch (e) { reject(new Error('Invalid response')); }
+            } else { reject(new Error(`Upload failed: ${xhr.status}`)); }
+          };
+          xhr.onerror = () => reject(new Error('Network error'));
+        });
+        xhr.send(formData);
+
+        await promise;
+        progressFill.style.width = '100%';
+        statusDiv.textContent = '✅ Готово!';
+        
+        document.getElementById('upload-modal').classList.remove('active');
+        document.getElementById('vid-title').value = '';
+        document.getElementById('vid-desc').value = '';
+        document.getElementById('vid-tags').value = '';
+        document.getElementById('vid-file').value = '';
+        progressBar.style.display = 'none';
+        statusDiv.textContent = '';
+        loadVideos();
+        alert('✅ Видео загружено и доступно для просмотра!');
+      } catch (e) {
+        statusDiv.textContent = '❌ Ошибка: ' + e.message;
+        console.error(e);
+      }
+    });
+
+    // ====== Лента ======
+    async function loadVideos() {
+      try {
+        const res = await fetch(`${SKYVIDEO_URL}/list`);
+        const data = await res.json();
+        const container = document.getElementById('video-feed');
+        if (!Array.isArray(data)) return;
+        container.innerHTML = data.map(v => `
+          <div class="video-card" onclick="openPlayer('${v.id}')">
+            <div style="width:100%;height:150px;background:#1a233a;display:flex;align-items:center;justify-content:center;font-size:3rem;">🎬</div>
+            <div class="info">
+              <div class="title">${escapeHtml(v.title)}</div>
+              <div class="meta">${escapeHtml(v.author)} • ${v.views} просмотров</div>
+            </div>
+          </div>`).join('');
+      } catch (e) {
+        document.getElementById('video-feed').innerHTML = '<p style="text-align:center;color:#8899cc;">Не удалось загрузить видео</p>';
+      }
+    }
+
+    // ====== Плеер ======
+    window.openPlayer = async (videoId) => {
+      const res = await fetch(`${SKYVIDEO_URL}/video/${videoId}/meta`);
+      const meta = await res.json();
+      document.getElementById('player-modal').classList.add('active');
+      const pc = document.getElementById('player-container');
+      pc.innerHTML = `
+        <video id="player-video" controls autoplay style="width:100%;max-height:500px;background:#000;border-radius:8px;">
+          <source src="${SKYVIDEO_URL}/video/${videoId}" type="${meta.mimetype || 'video/mp4'}">
+        </video>
+        <div id="player-meta-${videoId}"></div>
+      `;
+      renderPlayerMeta(videoId, meta);
+      fetch(`${SKYVIDEO_URL}/video/${videoId}/view`, { method: 'POST' }).catch(()=>{});
+    };
+
+    function renderPlayerMeta(videoId, meta) {
+      const container = document.getElementById('player-meta-' + videoId);
+      const isOwner = currentUser && meta.skyid === currentUser.login;
+      const isAdmin = currentUser && currentUser.login === 'SkyMonder';
+      let html = `<h3>${escapeHtml(meta.title)}</h3><p>${escapeHtml(meta.description)}</p><p>Теги: ${meta.tags.join(', ')}</p>
+        <div class="actions">
+          <button class="btn" onclick="likeVideo('${videoId}')">❤️ ${meta.likes.length}</button>
+          <button class="btn" onclick="dislikeVideo('${videoId}')">👎 ${meta.dislikes.length}</button>
+          <span>👀 ${meta.views}</span>
+          ${ (isOwner || isAdmin) ? `<button class="btn btn-danger" onclick="deleteVideo('${videoId}')">🗑️</button>` : '' }
+        </div>`;
+      html += `<div class="comments"><h4>Комментарии</h4>`;
+      meta.comments.forEach(c => {
+        html += `<div class="comment-item">
+          <div><strong>${escapeHtml(c.author)}</strong>: ${escapeHtml(c.text)}</div>
+          <div class="actions">
+            ${ (currentUser && (c.skyid === currentUser.login || isAdmin)) ? `<button class="btn btn-danger" onclick="deleteComment('${videoId}','${c.id}')">×</button>` : '' }
+          </div>
+        </div>`;
       });
+      html += `</div>`;
+      if (currentUser) {
+        html += `<div style="margin-top:0.5rem;"><input type="text" id="new-comment" placeholder="Комментарий..."><button class="btn" onclick="addComment('${videoId}')">➤</button></div>`;
+      }
+      container.innerHTML = html;
+    }
 
-      variantStreams.push({
-        label: quality.label,
-        width: quality.width,
-        height: quality.height,
-        bitrate: quality.bitrate,
-        playlist: `/video/${videoId}/${quality.label}/playlist.m3u8`
+    // ====== Лайки/комментарии ======
+    window.likeVideo = async (id) => {
+      await fetch(`${SKYVIDEO_URL}/video/${id}/like`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
+      refreshMeta(id);
+    };
+    window.dislikeVideo = async (id) => {
+      await fetch(`${SKYVIDEO_URL}/video/${id}/dislike`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
+      refreshMeta(id);
+    };
+    window.deleteVideo = async (id) => {
+      if (!confirm('Удалить видео?')) return;
+      await fetch(`${SKYVIDEO_URL}/video/${id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+      document.getElementById('player-modal').classList.remove('active');
+      loadVideos();
+    };
+    window.addComment = async (videoId) => {
+      const text = document.getElementById('new-comment').value.trim();
+      if (!text) return;
+      await fetch(`${SKYVIDEO_URL}/video/${videoId}/comment`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ text })
       });
+      refreshMeta(videoId);
+    };
+    window.deleteComment = async (videoId, commentId) => {
+      if (!confirm('Удалить комментарий?')) return;
+      await fetch(`${SKYVIDEO_URL}/video/${videoId}/comment/${commentId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      refreshMeta(videoId);
+    };
+    async function refreshMeta(videoId) {
+      const res = await fetch(`${SKYVIDEO_URL}/video/${videoId}/meta`);
+      const meta = await res.json();
+      renderPlayerMeta(videoId, meta);
     }
 
-    // Мастер-плейлист
-    let masterContent = '#EXTM3U\n#EXT-X-VERSION:3\n';
-    for (const v of variantStreams) {
-      const bitrateNum = parseInt(v.bitrate);
-      const resolution = `${v.width}x${v.height}`;
-      masterContent += `#EXT-X-STREAM-INF:BANDWIDTH=${bitrateNum*1000},RESOLUTION=${resolution}\n${v.playlist}\n`;
+    function escapeHtml(t) {
+      return String(t).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
     }
-    const masterPath = path.join(hlsVideoDir, 'master.m3u8');
-    fs.writeFileSync(masterPath, masterContent);
-
-    // Удаляем оригинал
-    if (fs.existsSync(originalPath)) fs.unlinkSync(originalPath);
-
-    // Обновляем метаданные
-    meta.status = 'ready';
-    meta.hlsMaster = `/video/${videoId}/master.m3u8`;
-    meta.qualities = variantStreams.map(v => ({ label: v.label, width: v.width, height: v.height, bitrate: v.bitrate }));
-    dbPut('videos', videoId, meta);
-
-    console.log(`✅ Video ${videoId} processed successfully`);
-  } catch (e) {
-    console.error(`❌ Video ${videoId} processing failed:`, e);
-    const meta = dbGet('videos', videoId);
-    if (meta) {
-      meta.status = 'failed';
-      dbPut('videos', videoId, meta);
-    }
-    if (fs.existsSync(originalPath)) fs.unlinkSync(originalPath);
-  }
-}
-
-// ====== Статус видео ======
-app.get('/video/:id/status', (req, res) => {
-  const meta = dbGet('videos', req.params.id);
-  if (!meta) return res.status(404).json({ error: 'Not found' });
-  res.json({ status: meta.status, hlsMaster: meta.hlsMaster });
-});
-
-// ====== HLS endpoints ======
-app.get('/video/:videoId/master.m3u8', (req, res) => {
-  const { videoId } = req.params;
-  const masterPath = path.join(HLS_DIR, videoId, 'master.m3u8');
-  if (!fs.existsSync(masterPath)) return res.status(404).send('Master playlist not found');
-  res.set('Content-Type', 'application/vnd.apple.mpegurl');
-  res.sendFile(masterPath);
-});
-app.get('/video/:videoId/:quality/playlist.m3u8', (req, res) => {
-  const { videoId, quality } = req.params;
-  const playlistPath = path.join(HLS_DIR, videoId, quality, 'playlist.m3u8');
-  if (!fs.existsSync(playlistPath)) return res.status(404).send('Playlist not found');
-  res.set('Content-Type', 'application/vnd.apple.mpegurl');
-  res.sendFile(playlistPath);
-});
-app.get('/video/:videoId/:quality/:segment', (req, res) => {
-  const { videoId, quality, segment } = req.params;
-  const segPath = path.join(HLS_DIR, videoId, quality, segment);
-  if (!fs.existsSync(segPath)) return res.status(404).send('Segment not found');
-  res.set('Content-Type', 'video/MP2T');
-  res.sendFile(segPath);
-});
-
-// ====== Fallback MP4 ======
-app.get('/video/:id', (req, res) => {
-  const meta = dbGet('videos', req.params.id);
-  if (!meta) return res.status(404).json({ error: 'Not found' });
-  if (meta.hlsMaster) return res.redirect(meta.hlsMaster);
-  const videoPath = path.join(VIDEO_DIR, meta.filename);
-  if (!fs.existsSync(videoPath)) return res.status(404).json({ error: 'File not found' });
-  const stat = fs.statSync(videoPath); const fileSize = stat.size;
-  const range = req.headers.range;
-  if (range) {
-    const parts = range.replace(/bytes=/, '').split('-');
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-    const chunksize = (end - start) + 1;
-    const file = fs.createReadStream(videoPath, { start, end });
-    res.writeHead(206, { 'Content-Range': `bytes ${start}-${end}/${fileSize}`, 'Accept-Ranges': 'bytes', 'Content-Length': chunksize, 'Content-Type': 'video/mp4' });
-    file.pipe(res);
-  } else {
-    res.writeHead(200, { 'Content-Length': fileSize, 'Content-Type': 'video/mp4' });
-    fs.createReadStream(videoPath).pipe(res);
-  }
-});
-
-// ====== Остальные эндпоинты (мета, лайки, комменты и т.д.) ======
-app.get('/video/:id/meta', (req, res) => {
-  const meta = dbGet('videos', req.params.id);
-  if (!meta) return res.status(404).json({ error: 'Not found' });
-  res.json(meta);
-});
-app.post('/video/:id/like', authMiddleware, (req, res) => {
-  const meta = dbGet('videos', req.params.id);
-  if (!meta) return res.status(404).json({ error: 'Not found' });
-  meta.dislikes = meta.dislikes.filter(u => u !== req.user.skyid);
-  if (!meta.likes.includes(req.user.skyid)) meta.likes.push(req.user.skyid);
-  else meta.likes = meta.likes.filter(u => u !== req.user.skyid);
-  dbPut('videos', req.params.id, meta);
-  res.json({ likes: meta.likes.length, dislikes: meta.dislikes.length });
-});
-app.post('/video/:id/dislike', authMiddleware, (req, res) => {
-  const meta = dbGet('videos', req.params.id);
-  if (!meta) return res.status(404).json({ error: 'Not found' });
-  meta.likes = meta.likes.filter(u => u !== req.user.skyid);
-  if (!meta.dislikes.includes(req.user.skyid)) meta.dislikes.push(req.user.skyid);
-  else meta.dislikes = meta.dislikes.filter(u => u !== req.user.skyid);
-  dbPut('videos', req.params.id, meta);
-  res.json({ likes: meta.likes.length, dislikes: meta.dislikes.length });
-});
-app.post('/video/:id/view', (req, res) => {
-  const meta = dbGet('videos', req.params.id);
-  if (!meta) return res.status(404).json({ error: 'Not found' });
-  meta.views = (meta.views || 0) + 1;
-  dbPut('videos', req.params.id, meta);
-  res.json({ views: meta.views });
-});
-app.get('/video/:id/comments', (req, res) => {
-  const meta = dbGet('videos', req.params.id);
-  if (!meta) return res.status(404).json({ error: 'Not found' });
-  res.json(meta.comments || []);
-});
-app.post('/video/:id/comment', authMiddleware, (req, res) => {
-  const meta = dbGet('videos', req.params.id);
-  if (!meta) return res.status(404).json({ error: 'Not found' });
-  const { text } = req.body;
-  if (!text) return res.status(400).json({ error: 'Text required' });
-  const comment = { id: 'cmt_' + Date.now(), skyid: req.user.skyid, author: req.user.login, text, created: Date.now() };
-  meta.comments.push(comment);
-  dbPut('videos', req.params.id, meta);
-  res.json(comment);
-});
-app.put('/video/:id/comment/:commentId', authMiddleware, (req, res) => {
-  const meta = dbGet('videos', req.params.id);
-  if (!meta) return res.status(404).json({ error: 'Not found' });
-  const comment = meta.comments.find(c => c.id === req.params.commentId);
-  if (!comment) return res.status(404).json({ error: 'Comment not found' });
-  if (comment.skyid !== req.user.skyid && !req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
-  comment.text = req.body.text;
-  dbPut('videos', req.params.id, meta);
-  res.json(comment);
-});
-app.delete('/video/:id/comment/:commentId', authMiddleware, (req, res) => {
-  const meta = dbGet('videos', req.params.id);
-  if (!meta) return res.status(404).json({ error: 'Not found' });
-  const comment = meta.comments.find(c => c.id === req.params.commentId);
-  if (!comment) return res.status(404).json({ error: 'Comment not found' });
-  if (comment.skyid !== req.user.skyid && !req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
-  meta.comments = meta.comments.filter(c => c.id !== req.params.commentId);
-  dbPut('videos', req.params.id, meta);
-  res.json({ ok: true });
-});
-app.delete('/video/:id', authMiddleware, (req, res) => {
-  const meta = dbGet('videos', req.params.id);
-  if (!meta) return res.status(404).json({ error: 'Not found' });
-  if (meta.skyid !== req.user.skyid && !req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
-  const hlsDir = path.join(HLS_DIR, req.params.id);
-  if (fs.existsSync(hlsDir)) fs.rmSync(hlsDir, { recursive: true, force: true });
-  if (meta.filename) {
-    const videoPath = path.join(VIDEO_DIR, meta.filename);
-    if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
-  }
-  dbDelete('videos', req.params.id);
-  res.json({ ok: true });
-});
-app.post('/admin/ban', authMiddleware, (req, res) => {
-  if (!req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
-  const { skyid } = req.body;
-  if (!skyid) return res.status(400).json({ error: 'skyid required' });
-  dbPut('bans', skyid, { skyid, bannedAt: Date.now() });
-  res.json({ ok: true });
-});
-app.post('/admin/unban', authMiddleware, (req, res) => {
-  if (!req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
-  const { skyid } = req.body;
-  dbDelete('bans', skyid);
-  res.json({ ok: true });
-});
-app.get('/list', (req, res) => {
-  const ids = dbList('videos');
-  const videos = ids.map(id => dbGet('videos', id)).filter(Boolean).sort((a,b) => b.created - a.created);
-  res.json(videos);
-});
-app.get('/search', (req, res) => {
-  const q = (req.query.q || '').toLowerCase();
-  const ids = dbList('videos');
-  const results = [];
-  for (const id of ids) {
-    const meta = dbGet('videos', id);
-    if (!meta) continue;
-    if (meta.title.toLowerCase().includes(q) || meta.description.toLowerCase().includes(q) || meta.tags.some(tag => tag.toLowerCase().includes(q))) {
-      results.push(meta);
-    }
-  }
-  res.json(results.sort((a,b) => b.created - a.created));
-});
-app.get('/verify', authMiddleware, (req, res) => {
-  res.json({ user: req.user, isAdmin: req.isAdmin });
-});
-
-// ====== Запуск сервера с таймаутами ======
-const server = http.createServer(app);
-
-// Увеличиваем таймауты для больших файлов
-server.timeout = 30 * 60 * 1000; // 30 минут
-server.keepAliveTimeout = 30 * 60 * 1000;
-server.headersTimeout = 60 * 60 * 1000; // 1 час
-
-server.listen(PORT, () => {
-  console.log(`🚀 SkyVideo running on port ${PORT}`);
-  console.log(`⏱️  Таймауты: ${server.timeout/1000}с, Keep-Alive: ${server.keepAliveTimeout/1000}с`);
-});
+  </script>
+</body>
+</html>
