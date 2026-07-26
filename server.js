@@ -10,7 +10,6 @@ const { spawn } = require('child_process');
 const compression = require('compression');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const pLimit = require('p-limit');
 const NodeCache = require('node-cache');
 const fastJson = require('fast-json-stringify');
 
@@ -45,8 +44,8 @@ const SKYID_URL = process.env.SKYID_URL || 'https://skymutant.onrender.com';
 const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'SkyMonder';
 
 // ====== Переменные для админ-панели ======
-const ADMIN_PANEL_USER = process.env.ADMIN_PANEL_USER;
-const ADMIN_PANEL_PASS = process.env.ADMIN_PANEL_PASS;
+const ADMIN_PANEL_USER = process.env.ADMIN_PANEL_USER || 'QUEUUOENGO_28937YAG';
+const ADMIN_PANEL_PASS = process.env.ADMIN_PANEL_PASS || 'BYOSOGB45BGWO45G7_34F';
 
 // ====== Директории ======
 const DATA_DIR = path.join(__dirname, 'data');
@@ -60,8 +59,39 @@ const THUMB_DIR = path.join(VIDEO_DIR, 'thumbnails');
 // ====== Кеш для метаданных ======
 const metaCache = new NodeCache({ stdTTL: 600, checkperiod: 120 });
 
-// ====== Ограничение параллельных конвертаций ======
-const convertLimit = pLimit(1); // только 1 процесс FFmpeg одновременно
+// ====== Самодельный семафор для ограничения параллельных задач ======
+class Semaphore {
+  constructor(max) {
+    this.max = max;
+    this.count = 0;
+    this.queue = [];
+  }
+  async acquire() {
+    if (this.count < this.max) {
+      this.count++;
+      return;
+    }
+    await new Promise(resolve => this.queue.push(resolve));
+    this.count++;
+  }
+  release() {
+    this.count--;
+    if (this.queue.length > 0) {
+      const resolve = this.queue.shift();
+      resolve();
+    }
+  }
+  async run(task) {
+    await this.acquire();
+    try {
+      return await task();
+    } finally {
+      this.release();
+    }
+  }
+}
+
+const semaphore = new Semaphore(1); // только 1 процесс FFmpeg одновременно
 
 // ====== Файловая БД ======
 function dbPut(bucket, key, data) {
@@ -107,75 +137,12 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-// ====== Модерация (локальный список, без AI) ======
+// ====== Модерация (локальный список) ======
 const BAD_WORDS = [
-  // ===== БАЗОВЫЕ МАТЕРНЫЕ КОРНИ (ОБСЦЕННАЯ ЛЕКСИКА) =====
-  // Ядро русского мата, от которых образуются сотни производных[reference:3]
-  'хуй', 'пизда', 'блядь', 'еб', 'ёб',
-
-  // ===== ПРОИЗВОДНЫЕ ОТ КОРНЕЙ (САМЫЕ РАСПРОСТРАНЕННЫЕ) =====
-  // От "хуй"
-  'хуйло', 'хуесос', 'хуила', 'хуйня', 'охуел', 'охуеть', 'нахуй', 'похуй', 'хуже',
-  // От "пизда"
-  'пиздец', 'пиздюк', 'пиздеть', 'пиздатый', 'пиздануть', 'распиздяй',
-  // От "блядь"
-  'бля', 'блять', 'блядство', 'блядун', 'блядюга',
-  // От "еб/ёб"
-  'ебать', 'ебаться', 'ебанутый', 'еблан', 'ёбаный', 'заебал', 'заебать', 'выебон',
-
-  // ===== ДРУГИЕ ГРУБЫЕ И ОСКОРБИТЕЛЬНЫЕ СЛОВА =====
-  // Оскорбления
-  'мудак', 'мудила', 'гандон', 'гондон', 'пидор', 'пидарас', 'педераст',
-  'сука', 'стерва', 'тварь', 'скотина', 'сволочь', 'падла', 'шалава',
-  'шлюха', 'курва', 'проститутка', 'бомж', 'лох', 'редиска', 'козел',
-  'баран', 'осел', 'свинья', 'гад', 'гадина', 'змей', 'идиот', 'дебил',
-  'даун', 'олень', 'индюк', 'петух', 'залупа', 'манда', 'писька',
-
-  // ===== СЛОВА ИЗ СТОП-ЛИСТОВ РОСКОМНАДЗОРА =====
-  // Корни, упомянутые в официальных списках[reference:4]
-  'бзд', 'бздеть', 'елд', 'говн', 'говно', 'говнять',
-  'жоп', 'жопа', 'манд', 'манда', 'муд', 'муди',
-  'перд', 'пердеть', 'пердун', 'сра', 'срать', 'срань',
-  'сса', 'ссать', 'шлюх', 'шлюха',
-
-  // ===== НАРКОТИКИ, ПСИХОАКТИВНЫЕ ВЕЩЕСТВА =====
-  'наркота', 'наркотик', 'анаша', 'марихуана', 'травка', 'шишки',
-  'спайс', 'соль', 'меф', 'мефедрон', 'кокаин', 'героин',
-  'экстази', 'амфетамин', 'метамфетамин', 'лсд', 'психоделик',
-  'дурман', 'дурь', 'химия', 'синтетика', 'закладка', 'клад',
-
-  // ===== НЕЗАКОННЫЕ ТОВАРЫ И УСЛУГИ =====
-  'электроудочка', 'электрофишер', 'гадание', 'эскорт', 'интим',
-  'оружие', 'пистолет', 'автомат', 'боеприпас', 'патрон',
-  'взрывчатка', 'динамит', 'кредит', 'займ', 'долг',
-
-  // ===== МОШЕННИЧЕСТВО И СПАМ =====
-  'развод', 'кидалово', 'кинуть', 'лохотрон', 'халява',
-  'скам', 'scam', 'фишинг', 'phishing', 'spam',
-  'взлом', 'взломать', 'хакинг', 'hacking', 'кряк', 'крякнутый',
-
-  // ===== ПОРНОГРАФИЯ И СЕКСУАЛЬНЫЙ КОНТЕНТ =====
-  'порно', 'porn', 'секс', 'sex', 'голый', 'обнаженный',
-  'сосет', 'минет', 'орал', 'групповушка', 'вибратор',
-
-  // ===== ЭКСТРЕМИЗМ, РАСИЗМ, КСЕНОФОБИЯ =====
-  'фашист', 'нацист', 'скинхед', 'черножопый', 'жид', 'хохол',
-  'москаль', 'чурка', 'хач', 'урод', 'дегенерат',
-
-  // ===== ОБХОДНЫЕ ВАРИАНТЫ (ТРАНСЛИТ, ЗАМЕНА БУКВ) =====
-  // Транслит
-  'xui', 'pizda', 'blyat', 'suka', 'pidor', 'pidaras',
-  'ebat', 'ebal', 'zabral', 'nahui',
-
-  // С заменой "а" на "о" и наоборот
-  'хyй', 'пиздо', 'бльоть', 'суко', 'мудо',
-
-  // С заменой "е" на "ё"
-  'ебё', 'пиздёж',
-
-  // Английские аналоги
-  'fuck', 'shit', 'ass', 'bitch', 'cunt', 'dick', 'pussy',
-  'bastard', 'whore', 'slut', 'nigger', 'faggot', 'retard'
+  'идиот', 'дебил', 'тупой', 'лох', 'дурак', 'кретин', 'урод',
+  'ублюдок', 'сволочь', 'тварь', 'сука', 'блядь', 'хуй', 'пизда',
+  'залупа', 'мудак', 'редиска', 'спам', 'бан', 'мат', 'оскорбление',
+  'нецензурная', 'порно', 'наркотики', 'взлом', 'мошенничество', 'скам', 'фишинг'
 ];
 
 function containsBadWords(text) {
@@ -185,7 +152,7 @@ function containsBadWords(text) {
 }
 
 async function checkAI(text) {
-  // Используем только локальный список для скорости
+  // Если есть ключ HF_API_KEY, можно включить реальный ИИ, но пока используем только локальный список
   return { toxic: containsBadWords(text), score: containsBadWords(text) ? 1 : 0 };
 }
 
@@ -326,7 +293,7 @@ async function generateThumbnail(videoId, videoPath) {
 
 // ====== Фоновая обработка видео (с ограничением) ======
 async function processVideoInBackground(videoId, originalPath) {
-  await convertLimit(async () => {
+  await semaphore.run(async () => {
     console.log(`🔄 Начинаем обработку видео ${videoId}`);
     try {
       const meta = dbGet('videos', videoId);
@@ -965,5 +932,5 @@ server.headersTimeout = 60 * 60 * 1000;
 
 server.listen(PORT, () => {
   console.log(`🚀 SkyVideo running on port ${PORT}`);
-  console.log(`⚡ Оптимизации активны: кеш, сжатие, лимиты, ограничение конвертаций`);
+  console.log(`⚡ Оптимизации активны: кеш, сжатие, лимиты, ограничение конвертаций (1 поток)`);
 });
