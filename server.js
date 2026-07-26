@@ -81,31 +81,49 @@ function authMiddleware(req, res, next) {
 // ========== Healthix ==========
 app.get('/healthix', (req, res) => res.json({ status: 'ok', service: 'skyvideo' }));
 
-// ========== Авторизация (с шифрованием) ==========
-app.post('/auth/register', async (req, res) => {
-  const { login, password } = req.body;
-  if (!login || !password) return res.status(400).json({ error: 'login/password required' });
+// ========== OAuth Client (SkyVideo) ==========
+// Генерируем URL для входа через SkyID
+app.get('/auth/login', (req, res) => {
+  const clientId = 'skyvideo'; // уникальный идентификатор приложения
+  const redirectUri = `${SKYVIDEO_URL}/auth/callback`;
+  const state = crypto.randomBytes(8).toString('hex');
+  // Сохраняем state в куки или сессию (для простоты передадим в URL)
+  const loginUrl = `${SKYID_URL}/oauth/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}`;
+  res.json({ loginUrl });
+});
+
+// Колбэк после успешного входа в SkyID
+app.get('/auth/callback', async (req, res) => {
+  const { code, state } = req.query;
+  if (!code) return res.status(400).send('Missing code');
   try {
-    const encryptedPayload = await encryptClientResponse({ login, password });
-    const resp = await axios.post(`${SKYID_URL}/register`, { data: encryptedPayload });
-    res.json(resp.data);
+    // Обмениваем код на токен
+    const tokenRes = await axios.post(`${SKYID_URL}/oauth/token`, {
+      code,
+      client_id: 'skyvideo',
+      client_secret: 'skyvideo_secret' // пока не проверяется, но можно добавить
+    });
+    const { access_token, skyid, login } = tokenRes.data;
+    // Можно сразу отдать токен клиенту через редирект с параметром
+    // Для простоты вернём JSON (клиент должен будет запросить его через fetch)
+    // Но лучше сделать редирект на страницу с передачей токена через URL-хэш
+    res.redirect(`/auth/success?token=${access_token}&skyid=${skyid}&login=${login}`);
   } catch (e) {
-    console.error('Register error:', e.response?.data || e);
-    res.status(e.response?.status || 500).json(e.response?.data || { error: 'Registration failed' });
+    res.status(500).send('OAuth failed');
   }
 });
 
-app.post('/auth/login', async (req, res) => {
-  const { login, password } = req.body;
-  if (!login || !password) return res.status(400).json({ error: 'login/password required' });
-  try {
-    const encryptedPayload = await encryptClientResponse({ login, password });
-    const resp = await axios.post(`${SKYID_URL}/login`, { data: encryptedPayload });
-    res.json(resp.data);
-  } catch (e) {
-    console.error('Login error:', e.response?.data || e);
-    res.status(e.response?.status || 500).json(e.response?.data || { error: 'Login failed' });
-  }
+app.get('/auth/success', (req, res) => {
+  // Простая страница, которая сохранит токен в localStorage и закроется/перенаправит
+  const { token, skyid, login } = req.query;
+  res.send(`
+    <html><body><script>
+      localStorage.setItem('skyvideo_token', '${token}');
+      localStorage.setItem('skyvideo_skyid', '${skyid}');
+      localStorage.setItem('skyvideo_login', '${login}');
+      window.location.href = '/'; // или на главную SkyVideo
+    </script></body></html>
+  `);
 });
 
 // ========== Профиль (имя канала) ==========
