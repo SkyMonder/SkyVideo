@@ -54,7 +54,7 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage,
   limits: {
-    fileSize: 500 * 1024 * 1024,
+    fileSize: 100 * 1024 * 1024, // 100 МБ (Render лимит)
     fieldSize: 50 * 1024 * 1024,
   }
 });
@@ -62,14 +62,14 @@ const upload = multer({
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
     if (err.code === 'LIMIT_FILE_SIZE') {
-      return res.status(413).json({ error: 'Файл слишком большой (максимум 500 МБ)' });
+      return res.status(413).json({ error: 'Файл слишком большой (максимум 100 МБ)' });
     }
     return res.status(400).json({ error: err.message });
   }
   next(err);
 });
 
-// ====== Проверка токена ======
+// ====== Проверка токена SkyID ======
 async function verifySkyToken(token) {
   try {
     const res = await axios.get(`${SKYID_URL}/me`, { headers: { Authorization: `Bearer ${token}` } });
@@ -135,41 +135,52 @@ app.get('/auth/success', (req, res) => {
   `);
 });
 
-// ====== Профиль ======
+// ====== Профиль канала ======
 app.get('/profile', authMiddleware, (req, res) => {
   let profile = dbGet('profiles', req.user.skyid);
-  if (!profile) profile = { name: req.user.login, avatar: '' };
+  if (!profile) profile = { name: req.user.login, avatar: '', bio: '' };
   res.json(profile);
 });
 app.put('/profile', authMiddleware, (req, res) => {
-  const { name, avatar } = req.body;
-  const profile = { name: name || req.user.login, avatar: avatar || '' };
+  const { name, avatar, bio } = req.body;
+  const profile = {
+    name: name || req.user.login,
+    avatar: avatar || '',
+    bio: bio || ''
+  };
   dbPut('profiles', req.user.skyid, profile);
   res.json(profile);
 });
 
-// ====== Загрузка видео ======
+// ====== Загрузка видео (без конвертации) ======
 app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => {
   try {
+    console.log('📥 Начало загрузки файла');
     const file = req.file;
-    if (!file) return res.status(400).json({ error: 'No video file' });
+    if (!file) {
+      console.error('❌ Файл не получен');
+      return res.status(400).json({ error: 'No video file' });
+    }
+    console.log(`📄 Имя: ${file.originalname}, Размер: ${file.size} байт`);
     const videoId = 'vid_' + Date.now();
     const videoPath = file.path;
     const { title, description, tags } = req.body;
     const tagArray = tags ? tags.split(',').map(t => t.trim()).filter(Boolean) : [];
 
+    // Перемещаем в папку videos
     const targetPath = path.join(VIDEO_DIR, videoId + path.extname(file.originalname));
     fs.renameSync(videoPath, targetPath);
 
     const stat = fs.statSync(targetPath);
 
+    // Метаданные видео
     const meta = {
       id: videoId,
       title: title || 'Без названия',
       description: description || '',
       tags: tagArray,
       author: req.user.login,
-      skyid: req.user.skyid,
+      authorSkyid: req.user.skyid,
       created: Date.now(),
       status: 'ready',
       likes: [],
@@ -179,13 +190,14 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
       filename: path.basename(targetPath),
       size: stat.size,
       mimetype: file.mimetype || 'video/mp4',
-      duration: 0
+      duration: 0 // можно добавить позже через ffprobe
     };
     dbPut('videos', videoId, meta);
 
+    console.log(`✅ Видео ${videoId} загружено`);
     res.json({ ok: true, videoId, video: meta });
   } catch (e) {
-    console.error('Upload error:', e);
+    console.error('❌ Ошибка загрузки:', e);
     if (req.file && req.file.path && fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
     }
@@ -193,15 +205,18 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
   }
 });
 
-// ====== Стриминг ======
+// ====== Стриминг видео (с поддержкой перемотки) ======
 app.get('/video/:id', (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
+  
   const videoPath = path.join(VIDEO_DIR, meta.filename);
   if (!fs.existsSync(videoPath)) return res.status(404).json({ error: 'File not found' });
+  
   const stat = fs.statSync(videoPath);
   const fileSize = stat.size;
   const range = req.headers.range;
+  
   if (range) {
     const parts = range.replace(/bytes=/, '').split('-');
     const start = parseInt(parts[0], 10);
@@ -226,7 +241,7 @@ app.get('/video/:id', (req, res) => {
   }
 });
 
-// ====== Статус видео ======
+// ====== Статус видео (всегда ready) ======
 app.get('/video/:id/status', (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
@@ -237,11 +252,7 @@ app.get('/video/:id/status', (req, res) => {
 app.get('/video/:id/meta', (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
-  // Подставляем имя канала и количество подписчиков
-  const profile = dbGet('profiles', meta.skyid);
-  const channelName = profile ? profile.name : meta.author;
-  const subscribers = dbGet('subscriptions', meta.skyid) || [];
-  res.json({ ...meta, channelName, subscribers: subscribers.length });
+  res.json(meta);
 });
 
 // ====== Лайки/дизлайки ======
@@ -321,36 +332,76 @@ app.delete('/video/:id', authMiddleware, (req, res) => {
   res.json({ ok: true });
 });
 
-// ====== Подписки ======
-// Подписаться
-app.post('/subscribe/:channelSkyId', authMiddleware, (req, res) => {
-  const subscriberSkyId = req.user.skyid;
-  const channelSkyId = req.params.channelSkyId;
-  if (subscriberSkyId === channelSkyId) return res.status(400).json({ error: 'Cannot subscribe to self' });
-  let subs = dbGet('subscriptions', channelSkyId) || [];
-  if (!subs.includes(subscriberSkyId)) {
-    subs.push(subscriberSkyId);
-    dbPut('subscriptions', channelSkyId, subs);
+// ====== ПОДПИСКИ ======
+// Подписаться на канал
+app.post('/follow/:skyid', authMiddleware, (req, res) => {
+  const targetSkyid = req.params.skyid;
+  if (targetSkyid === req.user.skyid) return res.status(400).json({ error: 'Нельзя подписаться на себя' });
+  
+  let follows = dbGet('follows', req.user.skyid) || { following: [] };
+  if (!follows.following.includes(targetSkyid)) {
+    follows.following.push(targetSkyid);
+    dbPut('follows', req.user.skyid, follows);
   }
-  res.json({ subscribed: true, count: subs.length });
+  res.json({ ok: true, following: follows.following });
 });
 
 // Отписаться
-app.delete('/subscribe/:channelSkyId', authMiddleware, (req, res) => {
-  const subscriberSkyId = req.user.skyid;
-  const channelSkyId = req.params.channelSkyId;
-  let subs = dbGet('subscriptions', channelSkyId) || [];
-  subs = subs.filter(id => id !== subscriberSkyId);
-  dbPut('subscriptions', channelSkyId, subs);
-  res.json({ subscribed: false, count: subs.length });
+app.delete('/follow/:skyid', authMiddleware, (req, res) => {
+  const targetSkyid = req.params.skyid;
+  let follows = dbGet('follows', req.user.skyid) || { following: [] };
+  follows.following = follows.following.filter(id => id !== targetSkyid);
+  dbPut('follows', req.user.skyid, follows);
+  res.json({ ok: true, following: follows.following });
 });
 
-// Статус подписки
-app.get('/subscribe/status/:channelSkyId', authMiddleware, (req, res) => {
-  const subscriberSkyId = req.user.skyid;
-  const channelSkyId = req.params.channelSkyId;
-  const subs = dbGet('subscriptions', channelSkyId) || [];
-  res.json({ subscribed: subs.includes(subscriberSkyId), count: subs.length });
+// Получить список подписок пользователя
+app.get('/follow/following', authMiddleware, (req, res) => {
+  const follows = dbGet('follows', req.user.skyid) || { following: [] };
+  res.json({ following: follows.following });
+});
+
+// Получить список подписчиков канала (пользователи, которые подписались на данного)
+app.get('/follow/followers/:skyid', (req, res) => {
+  const targetSkyid = req.params.skyid;
+  const allFollows = dbList('follows');
+  const followers = [];
+  for (const id of allFollows) {
+    const data = dbGet('follows', id);
+    if (data && data.following.includes(targetSkyid)) {
+      followers.push(id);
+    }
+  }
+  res.json({ followers });
+});
+
+// Проверить, подписан ли текущий пользователь на канал
+app.get('/follow/check/:skyid', authMiddleware, (req, res) => {
+  const targetSkyid = req.params.skyid;
+  const follows = dbGet('follows', req.user.skyid) || { following: [] };
+  res.json({ isFollowing: follows.following.includes(targetSkyid) });
+});
+
+// ====== Список видео ======
+app.get('/list', (req, res) => {
+  const ids = dbList('videos');
+  const videos = ids.map(id => dbGet('videos', id)).filter(Boolean).sort((a,b) => b.created - a.created);
+  res.json(videos);
+});
+
+// ====== Поиск ======
+app.get('/search', (req, res) => {
+  const q = (req.query.q || '').toLowerCase();
+  const ids = dbList('videos');
+  const results = [];
+  for (const id of ids) {
+    const meta = dbGet('videos', id);
+    if (!meta) continue;
+    if (meta.title.toLowerCase().includes(q) || meta.description.toLowerCase().includes(q) || meta.tags.some(tag => tag.toLowerCase().includes(q))) {
+      results.push(meta);
+    }
+  }
+  res.json(results.sort((a,b) => b.created - a.created));
 });
 
 // ====== Администрирование ======
@@ -368,59 +419,12 @@ app.post('/admin/unban', authMiddleware, (req, res) => {
   res.json({ ok: true });
 });
 
-// ====== Список видео ======
-app.get('/list', (req, res) => {
-  const ids = dbList('videos');
-  // Собираем профили для всех авторов
-  const profiles = {};
-  ids.forEach(id => {
-    const meta = dbGet('videos', id);
-    if (meta && !profiles[meta.skyid]) {
-      const p = dbGet('profiles', meta.skyid);
-      profiles[meta.skyid] = p ? p.name : meta.author;
-    }
-  });
-  const videos = ids.map(id => {
-    const meta = dbGet('videos', id);
-    if (!meta) return null;
-    const channelName = profiles[meta.skyid] || meta.author;
-    const subs = dbGet('subscriptions', meta.skyid) || [];
-    return { ...meta, channelName, subscribers: subs.length };
-  }).filter(Boolean).sort((a,b) => b.created - a.created);
-  res.json(videos);
-});
-
-// ====== Поиск ======
-app.get('/search', (req, res) => {
-  const q = (req.query.q || '').toLowerCase();
-  const ids = dbList('videos');
-  const profiles = {};
-  ids.forEach(id => {
-    const meta = dbGet('videos', id);
-    if (meta && !profiles[meta.skyid]) {
-      const p = dbGet('profiles', meta.skyid);
-      profiles[meta.skyid] = p ? p.name : meta.author;
-    }
-  });
-  const results = [];
-  for (const id of ids) {
-    const meta = dbGet('videos', id);
-    if (!meta) continue;
-    if (meta.title.toLowerCase().includes(q) || meta.description.toLowerCase().includes(q) || meta.tags.some(tag => tag.toLowerCase().includes(q))) {
-      const channelName = profiles[meta.skyid] || meta.author;
-      const subs = dbGet('subscriptions', meta.skyid) || [];
-      results.push({ ...meta, channelName, subscribers: subs.length });
-    }
-  }
-  res.json(results.sort((a,b) => b.created - a.created));
-});
-
 // ====== Проверка токена ======
 app.get('/verify', authMiddleware, (req, res) => {
   res.json({ user: req.user, isAdmin: req.isAdmin });
 });
 
-// ====== Запуск ======
+// ====== Запуск сервера ======
 const server = http.createServer(app);
 server.timeout = 30 * 60 * 1000;
 server.keepAliveTimeout = 30 * 60 * 1000;
