@@ -134,7 +134,6 @@ function authMiddleware(req, res, next) {
   if (!auth) return res.status(401).json({ error: 'Unauthorized' });
   verifySkyToken(auth).then(user => {
     if (!user) return res.status(401).json({ error: 'Invalid token' });
-    // Проверка бана
     if (isUserBanned(user.skyid)) {
       const ban = dbGet('bans', user.skyid);
       const remaining = Math.ceil((ban.until - Date.now()) / (1000 * 60 * 60));
@@ -263,10 +262,11 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
     const videoId = 'vid_' + Date.now();
     const videoPath = file.path;
     const { title, description, tags } = req.body;
+    // Исправление: безопасно преобразуем tags в массив
     const tagArray = tags ? tags.split(',').map(t => t.trim()).filter(Boolean) : [];
 
-    // ИИ-модерация
-    const fullText = title + ' ' + description + ' ' + (tags || '').join(' ');
+    // ИИ-модерация (используем tagArray)
+    const fullText = title + ' ' + description + ' ' + tagArray.join(' ');
     const aiResult = await checkAI(fullText);
     if (aiResult.toxic) {
       if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
@@ -413,7 +413,6 @@ app.post('/video/:id/comment', authMiddleware, async (req, res) => {
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: 'Text required' });
 
-  // ИИ-модерация комментария
   const aiResult = await checkAI(text);
   if (aiResult.toxic) {
     banUserWithDuration(req.user.skyid, 'Токсичный комментарий');
@@ -432,7 +431,6 @@ app.put('/video/:id/comment/:commentId', authMiddleware, async (req, res) => {
   if (!comment) return res.status(404).json({ error: 'Comment not found' });
   if (comment.skyid !== req.user.skyid && !req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
 
-  // ИИ-модерация при редактировании
   const aiResult = await checkAI(req.body.text);
   if (aiResult.toxic) {
     banUserWithDuration(req.user.skyid, 'Токсичный комментарий (редактирование)');
@@ -639,7 +637,6 @@ app.get('/admin/panel', authMiddleware, adminMiddleware, (req, res) => {
           \`).join('');
         }
 
-        // Дополнительная функция для разбана по клику из списка
         window.unbanUserById = async (skyid) => {
           await apiFetch('/admin/unban', { method: 'POST', body: JSON.stringify({ skyid }) });
           loadBanned();
@@ -654,7 +651,7 @@ app.get('/admin/panel', authMiddleware, adminMiddleware, (req, res) => {
   `);
 });
 
-// Админ-эндпоинты
+// ====== Админ-эндпоинты ======
 app.get('/admin/videos', authMiddleware, adminMiddleware, (req, res) => {
   const ids = dbList('videos');
   const videos = ids.map(id => dbGet('videos', id)).filter(Boolean).sort((a,b) => b.created - a.created);
@@ -698,16 +695,20 @@ app.post('/admin/unban', authMiddleware, adminMiddleware, (req, res) => {
 app.get('/admin/banned', authMiddleware, adminMiddleware, (req, res) => {
   const ids = dbList('bans');
   const banned = ids.map(id => dbGet('bans', id)).filter(Boolean);
-  // Фильтруем только активные
   const active = banned.filter(b => !b.until || Date.now() < b.until);
   res.json(active);
 });
 
-// ====== Список видео ======
+// ====== Список видео (защищённый от ошибок) ======
 app.get('/list', (req, res) => {
-  const ids = dbList('videos');
-  const videos = ids.map(id => dbGet('videos', id)).filter(Boolean).sort((a,b) => b.created - a.created);
-  res.json(videos);
+  try {
+    const ids = dbList('videos');
+    const videos = ids.map(id => dbGet('videos', id)).filter(Boolean).sort((a,b) => b.created - a.created);
+    res.json(videos);
+  } catch (e) {
+    console.error('❌ Ошибка в /list:', e);
+    res.status(500).json({ error: 'Internal server error', details: e.message });
+  }
 });
 
 // ====== Поиск ======
