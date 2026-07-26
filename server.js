@@ -7,8 +7,35 @@ const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
 const { spawn } = require('child_process');
+const compression = require('compression');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const pLimit = require('p-limit');
+const NodeCache = require('node-cache');
+const fastJson = require('fast-json-stringify');
 
+// ====== Инициализация ======
 const app = express();
+
+// ====== Защита и сжатие ======
+app.use(helmet());
+app.use(compression());
+
+// ====== Лимиты запросов ======
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: 'Слишком много загрузок с вашего IP, попробуйте позже'
+});
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  message: 'Слишком много запросов, попробуйте позже'
+});
+
+app.use('/upload', uploadLimiter);
+app.use('/video', globalLimiter);
+
 app.use(cors({ origin: '*', methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
@@ -29,6 +56,12 @@ const THUMB_DIR = path.join(VIDEO_DIR, 'thumbnails');
 [VIDEO_DIR, UPLOAD_TEMP, DATA_DIR, THUMB_DIR].forEach(d => {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 });
+
+// ====== Кеш для метаданных ======
+const metaCache = new NodeCache({ stdTTL: 600, checkperiod: 120 });
+
+// ====== Ограничение параллельных конвертаций ======
+const convertLimit = pLimit(1); // только 1 процесс FFmpeg одновременно
 
 // ====== Файловая БД ======
 function dbPut(bucket, key, data) {
@@ -74,7 +107,7 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-// ====== Локальный список запрещённых слов ======
+// ====== Модерация (локальный список, без AI) ======
 const BAD_WORDS = [
   // ===== БАЗОВЫЕ МАТЕРНЫЕ КОРНИ (ОБСЦЕННАЯ ЛЕКСИКА) =====
   // Ядро русского мата, от которых образуются сотни производных[reference:3]
@@ -151,42 +184,17 @@ function containsBadWords(text) {
   return BAD_WORDS.some(word => lower.includes(word));
 }
 
-// ====== ИИ-модерация через Hugging Face Inference API ======
-const AI_API_URL = 'https://api-inference.huggingface.co/models/Nelera/ru-toxicity-detection';
-const AI_API_KEY = process.env.HF_API_KEY;
-const TOXICITY_THRESHOLD = 0.8;
-
 async function checkAI(text) {
-  if (!AI_API_KEY) {
-    console.warn('⚠️ HF_API_KEY не задан, используем локальный список слов');
-    return { toxic: containsBadWords(text), score: containsBadWords(text) ? 1 : 0 };
-  }
-  try {
-    const response = await axios.post(
-      AI_API_URL,
-      { inputs: text },
-      {
-        headers: { Authorization: `Bearer ${AI_API_KEY}` },
-        timeout: 5000,
-      }
-    );
-    const result = response.data[0] || {};
-    const isToxic = result.label === 'LABEL_1';
-    const score = result.score || 0;
-    const localResult = containsBadWords(text);
-    return { toxic: isToxic || localResult, score: Math.max(score, localResult ? 1 : 0) };
-  } catch (e) {
-    console.error('❌ Ошибка ИИ-модерации:', e.message);
-    return { toxic: containsBadWords(text), score: containsBadWords(text) ? 1 : 0 };
-  }
+  // Используем только локальный список для скорости
+  return { toxic: containsBadWords(text), score: containsBadWords(text) ? 1 : 0 };
 }
 
-// ====== Бан с длительностью ======
+// ====== Бан ======
 function banUserWithDuration(skyid, reason, days = 2) {
   const until = Date.now() + days * 24 * 60 * 60 * 1000;
   dbPut('bans', skyid, {
     skyid,
-    reason: reason || 'Нарушение правил (ИИ)',
+    reason: reason || 'Нарушение правил',
     bannedAt: Date.now(),
     until: until,
   });
@@ -203,7 +211,7 @@ function isUserBanned(skyid) {
   return true;
 }
 
-// ====== Проверка токена и прав ======
+// ====== Auth ======
 async function verifySkyToken(token) {
   try {
     const res = await axios.get(`${SKYID_URL}/me`, { headers: { Authorization: `Bearer ${token}` } });
@@ -229,18 +237,14 @@ function authMiddleware(req, res, next) {
   }).catch(() => res.status(401).json({ error: 'Invalid token' }));
 }
 
-// ====== Middleware для админ-панели (отдельная авторизация) ======
+// ====== Админ-авторизация ======
 const adminSessions = new Map();
-
 function generateAdminToken() {
   return crypto.randomBytes(32).toString('hex');
 }
-
 function adminAuthMiddleware(req, res, next) {
   const auth = req.headers.authorization?.replace('Bearer ', '');
-  if (!auth) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+  if (!auth) return res.status(401).json({ error: 'Unauthorized' });
   const session = adminSessions.get(auth);
   if (!session || Date.now() > session.expires) {
     adminSessions.delete(auth);
@@ -314,40 +318,65 @@ app.put('/profile', authMiddleware, (req, res) => {
   res.json(profile);
 });
 
-// ====== Генерация превью ======
+// ====== Генерация превью (отключена) ======
 async function generateThumbnail(videoId, videoPath) {
-  let ffmpegCmd = 'ffmpeg';
-  try {
-    await new Promise((resolve, reject) => {
-      const test = spawn(ffmpegCmd, ['-version']);
-      test.on('close', (code) => code === 0 ? resolve() : reject());
-      test.on('error', reject);
-    });
-  } catch (e) {
-    console.warn('⚠️ FFmpeg не установлен, превью не будет создано');
-    return null;
-  }
-  const thumbPath = path.join(THUMB_DIR, videoId + '.jpg');
-  try {
-    const ff = spawn(ffmpegCmd, [
-      '-i', videoPath,
-      '-ss', '00:00:01',
-      '-vframes', '1',
-      '-vf', 'scale=320:180',
-      '-q:v', '2',
-      '-y',
-      thumbPath
-    ]);
-    await new Promise((resolve, reject) => {
-      ff.on('close', (code) => code === 0 ? resolve() : reject(new Error('FFmpeg failed')));
-      ff.on('error', reject);
-    });
-    console.log(`✅ Превью создано для видео ${videoId}`);
-    return `/thumbnails/${videoId}.jpg`;
-  } catch (e) {
-    console.error('❌ Ошибка генерации превью:', e.message);
-    return null;
-  }
+  console.warn('⚠️ Генерация превью отключена для экономии памяти');
+  return null;
+}
+
+// ====== Фоновая обработка видео (с ограничением) ======
+async function processVideoInBackground(videoId, originalPath) {
+  await convertLimit(async () => {
+    console.log(`🔄 Начинаем обработку видео ${videoId}`);
+    try {
+      const meta = dbGet('videos', videoId);
+      if (!meta) throw new Error('Video not found');
+
+      const outputDir = path.join(VIDEO_DIR, 'processed');
+      if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+      const outputPath = path.join(outputDir, videoId + '.mp4');
+
+      // FFmpeg с минимальным потреблением ресурсов
+      const ffmpegArgs = [
+        '-i', originalPath,
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-crf', '30',
+        '-vf', 'scale=854:480',
+        '-c:a', 'aac',
+        '-b:a', '96k',
+        '-movflags', '+faststart',
+        outputPath
+      ];
+
+      await new Promise((resolve, reject) => {
+        const ff = spawn('ffmpeg', ffmpegArgs);
+        ff.stderr.on('data', d => console.log(d.toString()));
+        ff.on('close', code => code === 0 ? resolve() : reject(new Error(`FFmpeg exited with ${code}`)));
+        ff.on('error', reject);
+      });
+
+      // Обновляем метаданные
+      meta.filename = 'processed/' + videoId + '.mp4';
+      meta.status = 'ready';
+      dbPut('videos', videoId, meta);
+      metaCache.set(videoId, meta);
+      console.log(`✅ Видео ${videoId} обработано`);
+
+      // Удаляем оригинал
+      if (fs.existsSync(originalPath)) fs.unlinkSync(originalPath);
+
+    } catch (err) {
+      console.error(`❌ Ошибка обработки видео ${videoId}:`, err.message);
+      const meta = dbGet('videos', videoId);
+      if (meta) {
+        meta.status = 'failed';
+        dbPut('videos', videoId, meta);
+        metaCache.set(videoId, meta);
+      }
+      if (fs.existsSync(originalPath)) fs.unlinkSync(originalPath);
+    }
+  });
 }
 
 // ====== Загрузка видео ======
@@ -360,6 +389,7 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
     const { title, description, tags } = req.body;
     const tagArray = tags ? tags.split(',').map(t => t.trim()).filter(Boolean) : [];
 
+    // Модерация
     const fullText = title + ' ' + description + ' ' + tagArray.join(' ');
     const aiResult = await checkAI(fullText);
     if (aiResult.toxic) {
@@ -368,10 +398,7 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
       return res.status(403).json({ error: 'Ваше видео содержит неприемлемый контент. Вы забанены на 2 дня.' });
     }
 
-    const targetPath = path.join(VIDEO_DIR, videoId + path.extname(file.originalname));
-    fs.renameSync(videoPath, targetPath);
-    const stat = fs.statSync(targetPath);
-
+    // Сохраняем метаданные (пока без файла)
     const meta = {
       id: videoId,
       title: title || 'Без названия',
@@ -380,31 +407,25 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
       author: req.user.login,
       authorSkyid: req.user.skyid,
       created: Date.now(),
-      status: 'ready',
+      status: 'processing', // начнём обработку
       likes: [],
       dislikes: [],
       views: 0,
       comments: [],
-      filename: path.basename(targetPath),
-      size: stat.size,
+      filename: null,
+      size: 0,
       mimetype: file.mimetype || 'video/mp4',
       duration: 0,
       thumbnail: null,
       moderated: true
     };
     dbPut('videos', videoId, meta);
+    metaCache.set(videoId, meta);
 
-    generateThumbnail(videoId, targetPath).then(thumbUrl => {
-      if (thumbUrl) {
-        const updated = dbGet('videos', videoId);
-        if (updated) {
-          updated.thumbnail = thumbUrl;
-          dbPut('videos', videoId, updated);
-        }
-      }
-    });
+    // Запускаем обработку в фоне
+    processVideoInBackground(videoId, videoPath);
 
-    res.json({ ok: true, videoId, video: meta });
+    res.json({ ok: true, videoId, status: 'processing' });
   } catch (e) {
     console.error('❌ Ошибка загрузки:', e);
     if (req.file && req.file.path && fs.existsSync(req.file.path)) {
@@ -417,14 +438,17 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
 // ====== Раздача превью ======
 app.get('/thumbnails/:filename', (req, res) => {
   const thumbPath = path.join(THUMB_DIR, req.params.filename);
-  if (!fs.existsSync(thumbPath)) return res.status(404).send('Not found');
+  if (!fs.existsSync(thumbPath)) return res.status(404).json({ error: 'Not found' });
   res.sendFile(thumbPath);
 });
 
-// ====== Стриминг ======
+// ====== Стриминг видео ======
 app.get('/video/:id', (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
+  if (meta.status !== 'ready') {
+    return res.status(202).json({ error: 'Video is still processing' });
+  }
   const videoPath = path.join(VIDEO_DIR, meta.filename);
   if (!fs.existsSync(videoPath)) return res.status(404).json({ error: 'File not found' });
   const stat = fs.statSync(videoPath);
@@ -454,14 +478,24 @@ app.get('/video/:id', (req, res) => {
 
 // ====== Статус ======
 app.get('/video/:id/status', (req, res) => {
-  const meta = dbGet('videos', req.params.id);
+  const meta = getCachedMeta(req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
-  res.json({ status: 'ready', videoUrl: `/video/${meta.id}` });
+  res.json({ status: meta.status });
 });
 
-// ====== Метаданные ======
+// ====== Кешированное получение метаданных ======
+function getCachedMeta(videoId) {
+  let meta = metaCache.get(videoId);
+  if (!meta) {
+    meta = dbGet('videos', videoId);
+    if (meta) metaCache.set(videoId, meta);
+  }
+  return meta;
+}
+
+// ====== Метаданные (используют кеш) ======
 app.get('/video/:id/meta', (req, res) => {
-  const meta = dbGet('videos', req.params.id);
+  const meta = getCachedMeta(req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
   res.json(meta);
 });
@@ -474,6 +508,7 @@ app.post('/video/:id/like', authMiddleware, (req, res) => {
   if (!meta.likes.includes(req.user.skyid)) meta.likes.push(req.user.skyid);
   else meta.likes = meta.likes.filter(u => u !== req.user.skyid);
   dbPut('videos', req.params.id, meta);
+  metaCache.set(req.params.id, meta);
   res.json({ likes: meta.likes.length, dislikes: meta.dislikes.length });
 });
 app.post('/video/:id/dislike', authMiddleware, (req, res) => {
@@ -483,6 +518,7 @@ app.post('/video/:id/dislike', authMiddleware, (req, res) => {
   if (!meta.dislikes.includes(req.user.skyid)) meta.dislikes.push(req.user.skyid);
   else meta.dislikes = meta.dislikes.filter(u => u !== req.user.skyid);
   dbPut('videos', req.params.id, meta);
+  metaCache.set(req.params.id, meta);
   res.json({ likes: meta.likes.length, dislikes: meta.dislikes.length });
 });
 
@@ -492,12 +528,13 @@ app.post('/video/:id/view', (req, res) => {
   if (!meta) return res.status(404).json({ error: 'Not found' });
   meta.views = (meta.views || 0) + 1;
   dbPut('videos', req.params.id, meta);
+  metaCache.set(req.params.id, meta);
   res.json({ views: meta.views });
 });
 
 // ====== Комментарии ======
 app.get('/video/:id/comments', (req, res) => {
-  const meta = dbGet('videos', req.params.id);
+  const meta = getCachedMeta(req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
   res.json(meta.comments || []);
 });
@@ -516,6 +553,7 @@ app.post('/video/:id/comment', authMiddleware, async (req, res) => {
   const comment = { id: 'cmt_' + Date.now(), skyid: req.user.skyid, author: req.user.login, text, created: Date.now() };
   meta.comments.push(comment);
   dbPut('videos', req.params.id, meta);
+  metaCache.set(req.params.id, meta);
   res.json(comment);
 });
 app.put('/video/:id/comment/:commentId', authMiddleware, async (req, res) => {
@@ -533,6 +571,7 @@ app.put('/video/:id/comment/:commentId', authMiddleware, async (req, res) => {
 
   comment.text = req.body.text;
   dbPut('videos', req.params.id, meta);
+  metaCache.set(req.params.id, meta);
   res.json(comment);
 });
 app.delete('/video/:id/comment/:commentId', authMiddleware, (req, res) => {
@@ -543,6 +582,7 @@ app.delete('/video/:id/comment/:commentId', authMiddleware, (req, res) => {
   if (comment.skyid !== req.user.skyid && !req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
   meta.comments = meta.comments.filter(c => c.id !== req.params.commentId);
   dbPut('videos', req.params.id, meta);
+  metaCache.set(req.params.id, meta);
   res.json({ ok: true });
 });
 
@@ -556,6 +596,7 @@ app.delete('/video/:id', authMiddleware, (req, res) => {
   const thumbPath = path.join(THUMB_DIR, meta.id + '.jpg');
   if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
   dbDelete('videos', req.params.id);
+  metaCache.del(req.params.id);
   res.json({ ok: true });
 });
 
@@ -599,7 +640,7 @@ app.get('/follow/check/:skyid', authMiddleware, (req, res) => {
   res.json({ isFollowing: follows.following.includes(targetSkyid) });
 });
 
-// ====== АДМИН-ПАНЕЛЬ ======
+// ====== Админ-панель ======
 app.post('/admin/login', (req, res) => {
   const { login, password } = req.body;
   if (login === ADMIN_PANEL_USER && password === ADMIN_PANEL_PASS) {
@@ -667,9 +708,7 @@ app.get('/admin/panel', (req, res) => {
         </div>
       </div>
       <script>
-        // Используем относительные URL (без указания протокола и хоста)
         const API_BASE = '';
-
         let adminToken = localStorage.getItem('admin_token') || '';
 
         function checkAuth() {
@@ -836,7 +875,7 @@ app.get('/admin/panel', (req, res) => {
   `);
 });
 
-// ====== Админ-эндпоинты ======
+// ====== Админские эндпоинты ======
 app.get('/admin/videos', adminAuthMiddleware, (req, res) => {
   const ids = dbList('videos');
   const videos = ids.map(id => dbGet('videos', id)).filter(Boolean).sort((a,b) => b.created - a.created);
@@ -851,6 +890,7 @@ app.delete('/admin/video/:videoId', adminAuthMiddleware, (req, res) => {
   const thumbPath = path.join(THUMB_DIR, meta.id + '.jpg');
   if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
   dbDelete('videos', req.params.videoId);
+  metaCache.del(req.params.videoId);
   res.json({ ok: true });
 });
 
@@ -861,6 +901,7 @@ app.delete('/admin/comment/:videoId/:commentId', adminAuthMiddleware, (req, res)
   if (!comment) return res.status(404).json({ error: 'Comment not found' });
   meta.comments = meta.comments.filter(c => c.id !== req.params.commentId);
   dbPut('videos', req.params.videoId, meta);
+  metaCache.set(req.params.videoId, meta);
   res.json({ ok: true });
 });
 
@@ -916,7 +957,7 @@ app.get('/verify', authMiddleware, (req, res) => {
   res.json({ user: req.user, isAdmin: req.isAdmin });
 });
 
-// ====== Запуск ======
+// ====== Запуск сервера ======
 const server = http.createServer(app);
 server.timeout = 30 * 60 * 1000;
 server.keepAliveTimeout = 30 * 60 * 1000;
@@ -924,7 +965,5 @@ server.headersTimeout = 60 * 60 * 1000;
 
 server.listen(PORT, () => {
   console.log(`🚀 SkyVideo running on port ${PORT}`);
-  console.log(`🤖 ИИ-модерация с моделью Nelera/ru-toxicity-detection (${AI_API_KEY ? 'активна' : 'отключена (нет ключа)'})`);
-  console.log(`📋 Локальный список слов содержит ${BAD_WORDS.length} записей`);
-  console.log(`🔐 Админ-панель доступна по логину/паролю из переменных окружения`);
+  console.log(`⚡ Оптимизации активны: кеш, сжатие, лимиты, ограничение конвертаций`);
 });
