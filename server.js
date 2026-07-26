@@ -10,19 +10,26 @@ const multer = require('multer');
 const { spawn } = require('child_process');
 
 const app = express();
+
+// ====== Увеличенные лимиты и таймауты ======
 app.use(cors({ origin: '*', methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 const PORT = process.env.PORT || 3000;
 const SKYID_URL = process.env.SKYID_URL || 'https://skymutant.onrender.com';
 const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'SkyMonder';
+
+// Директории
 const DATA_DIR = path.join(__dirname, 'data');
 const VIDEO_DIR = path.join(__dirname, 'videos');
 const UPLOAD_TEMP = path.join(__dirname, 'uploads');
 const HLS_DIR = path.join(VIDEO_DIR, 'hls');
-[VIDEO_DIR, UPLOAD_TEMP, HLS_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
+[VIDEO_DIR, UPLOAD_TEMP, HLS_DIR, DATA_DIR].forEach(d => {
+  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+});
 
-// ---------- Файловая БД ----------
+// ====== Файловая БД ======
 function dbPut(bucket, key, data) {
   const dir = path.join(DATA_DIR, bucket);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -43,13 +50,40 @@ function dbDelete(bucket, key) {
   if (fs.existsSync(file)) fs.unlinkSync(file);
 }
 
+// ====== Multer с большими лимитами ======
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_TEMP),
-  filename: (req, file, cb) => cb(null, Date.now() + '_' + Math.random().toString(36).slice(2,8) + path.extname(file.originalname))
+  destination: (req, file, cb) => {
+    // Убедимся, что папка существует
+    if (!fs.existsSync(UPLOAD_TEMP)) fs.mkdirSync(UPLOAD_TEMP, { recursive: true });
+    cb(null, UPLOAD_TEMP);
+  },
+  filename: (req, file, cb) => {
+    cb(null, Date.now() + '_' + Math.random().toString(36).slice(2,8) + path.extname(file.originalname));
+  }
 });
-const upload = multer({ storage, limits: { fileSize: 200 * 1024 * 1024 } });
 
-// ========== Поиск FFmpeg и FFprobe ==========
+const upload = multer({
+  storage,
+  limits: {
+    fileSize: 500 * 1024 * 1024, // 500 МБ (максимум для Render)
+    fieldSize: 50 * 1024 * 1024,
+    parts: 100,
+    headerPairs: 2000
+  }
+});
+
+// Обработка ошибок multer
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({ error: 'Файл слишком большой (максимум 500 МБ)' });
+    }
+    return res.status(400).json({ error: err.message });
+  }
+  next(err);
+});
+
+// ====== Поиск FFmpeg ======
 function findBinary(name) {
   const envVar = process.env[name.toUpperCase() + '_PATH'];
   if (envVar && fs.existsSync(envVar)) return envVar;
@@ -66,13 +100,14 @@ const FFPROBE_PATH = findBinary('ffprobe');
 console.log(`🔧 FFmpeg: ${FFMPEG_PATH}`);
 console.log(`🔧 FFprobe: ${FFPROBE_PATH}`);
 
-// Проверка токена SkyID
+// ====== Проверка токена ======
 async function verifySkyToken(token) {
   try {
     const res = await axios.get(`${SKYID_URL}/me`, { headers: { Authorization: `Bearer ${token}` } });
     return res.data;
   } catch (e) { return null; }
 }
+
 function authMiddleware(req, res, next) {
   const auth = req.headers.authorization?.replace('Bearer ', '');
   if (!auth) return res.status(401).json({ error: 'Unauthorized' });
@@ -84,10 +119,10 @@ function authMiddleware(req, res, next) {
   }).catch(() => res.status(401).json({ error: 'Invalid token' }));
 }
 
-// ========== Healthix ==========
+// ====== Health ======
 app.get('/healthix', (req, res) => res.json({ status: 'ok', service: 'skyvideo' }));
 
-// ========== OAuth Client ==========
+// ====== OAuth ======
 app.get('/auth/login', (req, res) => {
   const clientId = 'skyvideo';
   const scope = req.query.scope || 'profile email';
@@ -98,7 +133,7 @@ app.get('/auth/login', (req, res) => {
   res.json({ loginUrl });
 });
 app.get('/auth/callback', async (req, res) => {
-  const { code, state } = req.query;
+  const { code } = req.query;
   if (!code) return res.status(400).send('Missing code');
   try {
     const tokenRes = await axios.post(`${SKYID_URL}/oauth/token`, {
@@ -131,7 +166,7 @@ app.get('/auth/success', (req, res) => {
   `);
 });
 
-// ========== Профиль ==========
+// ====== Профиль ======
 app.get('/profile', authMiddleware, (req, res) => {
   let profile = dbGet('profiles', req.user.skyid);
   if (!profile) profile = { name: req.user.login, avatar: '' };
@@ -144,13 +179,13 @@ app.put('/profile', authMiddleware, (req, res) => {
   res.json(profile);
 });
 
-// ========== Конфигурация качества (упрощённая для скорости) ==========
+// ====== Конфигурация качества (оптимизирована для скорости) ======
 const QUALITY_CONFIGS = [
   { label: '720p', width: 1280, height: 720, bitrate: '1500k', maxrate: '1500k', bufsize: '3000k' },
   { label: '480p', width: 854, height: 480, bitrate: '800k', maxrate: '800k', bufsize: '1600k' }
 ];
 
-// ========== Загрузка видео (асинхронная) ==========
+// ====== Загрузка видео (асинхронная) ======
 app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => {
   try {
     const file = req.file;
@@ -169,7 +204,7 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
       author: req.user.login,
       skyid: req.user.skyid,
       created: Date.now(),
-      status: 'processing',      // 'processing' | 'ready' | 'failed'
+      status: 'processing',
       likes: [],
       dislikes: [],
       views: 0,
@@ -186,11 +221,15 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
     processVideoInBackground(videoId, originalPath);
   } catch (e) {
     console.error('Upload error:', e);
+    // Если ошибка, удаляем загруженный файл, если он есть
+    if (req.file && req.file.path && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
+    }
     res.status(500).json({ error: 'Upload failed: ' + e.message });
   }
 });
 
-// ========== Фоновая обработка видео ==========
+// ====== Фоновая обработка ======
 async function processVideoInBackground(videoId, originalPath) {
   try {
     const meta = dbGet('videos', videoId);
@@ -199,7 +238,7 @@ async function processVideoInBackground(videoId, originalPath) {
     const hlsVideoDir = path.join(HLS_DIR, videoId);
     if (!fs.existsSync(hlsVideoDir)) fs.mkdirSync(hlsVideoDir, { recursive: true });
 
-    // Получаем разрешение видео
+    // Получаем разрешение
     let videoWidth = 1920, videoHeight = 1080;
     try {
       const probe = spawn(FFPROBE_PATH, ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', originalPath]);
@@ -233,7 +272,7 @@ async function processVideoInBackground(videoId, originalPath) {
         '-b:v', quality.bitrate,
         '-maxrate', quality.maxrate,
         '-bufsize', quality.bufsize,
-        '-preset', 'veryfast', // можно 'ultrafast' для максимальной скорости
+        '-preset', 'veryfast',
         '-profile:v', 'high',
         '-vf', `scale=trunc(${quality.width}/2)*2:trunc(${quality.height}/2)*2`,
         '-c:a', 'aac',
@@ -247,8 +286,12 @@ async function processVideoInBackground(videoId, originalPath) {
 
       await new Promise((resolve, reject) => {
         const ff = spawn(FFMPEG_PATH, ffmpegArgs);
-        ff.stderr.on('data', d => console.log(d.toString()));
-        ff.on('close', code => code === 0 ? resolve() : reject(new Error(`FFmpeg for ${quality.label} failed`)));
+        let stderr = '';
+        ff.stderr.on('data', d => { stderr += d.toString(); console.log(d.toString()); });
+        ff.on('close', code => {
+          if (code === 0) resolve();
+          else reject(new Error(`FFmpeg for ${quality.label} failed with code ${code}: ${stderr}`));
+        });
         ff.on('error', reject);
       });
 
@@ -261,7 +304,7 @@ async function processVideoInBackground(videoId, originalPath) {
       });
     }
 
-    // Генерируем мастер-плейлист
+    // Мастер-плейлист
     let masterContent = '#EXTM3U\n#EXT-X-VERSION:3\n';
     for (const v of variantStreams) {
       const bitrateNum = parseInt(v.bitrate);
@@ -271,8 +314,8 @@ async function processVideoInBackground(videoId, originalPath) {
     const masterPath = path.join(hlsVideoDir, 'master.m3u8');
     fs.writeFileSync(masterPath, masterContent);
 
-    // Удаляем оригинальный файл
-    fs.unlinkSync(originalPath);
+    // Удаляем оригинал
+    if (fs.existsSync(originalPath)) fs.unlinkSync(originalPath);
 
     // Обновляем метаданные
     meta.status = 'ready';
@@ -283,25 +326,23 @@ async function processVideoInBackground(videoId, originalPath) {
     console.log(`✅ Video ${videoId} processed successfully`);
   } catch (e) {
     console.error(`❌ Video ${videoId} processing failed:`, e);
-    // Обновляем статус на failed
     const meta = dbGet('videos', videoId);
     if (meta) {
       meta.status = 'failed';
       dbPut('videos', videoId, meta);
     }
-    // Удаляем временный файл, если он ещё существует
     if (fs.existsSync(originalPath)) fs.unlinkSync(originalPath);
   }
 }
 
-// ========== Статус видео ==========
+// ====== Статус видео ======
 app.get('/video/:id/status', (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
   res.json({ status: meta.status, hlsMaster: meta.hlsMaster });
 });
 
-// ========== HLS endpoints ==========
+// ====== HLS endpoints ======
 app.get('/video/:videoId/master.m3u8', (req, res) => {
   const { videoId } = req.params;
   const masterPath = path.join(HLS_DIR, videoId, 'master.m3u8');
@@ -324,7 +365,7 @@ app.get('/video/:videoId/:quality/:segment', (req, res) => {
   res.sendFile(segPath);
 });
 
-// ========== Fallback MP4 (для совместимости) ==========
+// ====== Fallback MP4 ======
 app.get('/video/:id', (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
@@ -347,7 +388,7 @@ app.get('/video/:id', (req, res) => {
   }
 });
 
-// ========== Остальные эндпоинты ==========
+// ====== Остальные эндпоинты (мета, лайки, комменты и т.д.) ======
 app.get('/video/:id/meta', (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
@@ -461,4 +502,15 @@ app.get('/verify', authMiddleware, (req, res) => {
   res.json({ user: req.user, isAdmin: req.isAdmin });
 });
 
-app.listen(PORT, () => console.log(`SkyVideo running on port ${PORT}`));
+// ====== Запуск сервера с таймаутами ======
+const server = http.createServer(app);
+
+// Увеличиваем таймауты для больших файлов
+server.timeout = 30 * 60 * 1000; // 30 минут
+server.keepAliveTimeout = 30 * 60 * 1000;
+server.headersTimeout = 60 * 60 * 1000; // 1 час
+
+server.listen(PORT, () => {
+  console.log(`🚀 SkyVideo running on port ${PORT}`);
+  console.log(`⏱️  Таймауты: ${server.timeout/1000}с, Keep-Alive: ${server.keepAliveTimeout/1000}с`);
+});
