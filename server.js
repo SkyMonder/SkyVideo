@@ -19,7 +19,7 @@ const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'SkyMonder';
 const DATA_DIR = path.join(__dirname, 'data');
 const VIDEO_DIR = path.join(__dirname, 'videos');
 const UPLOAD_TEMP = path.join(__dirname, 'uploads');
-const HLS_DIR = path.join(VIDEO_DIR, 'hls'); // папка для HLS-сегментов
+const HLS_DIR = path.join(VIDEO_DIR, 'hls');
 [VIDEO_DIR, UPLOAD_TEMP, HLS_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
 
 // ---------- Файловая БД ----------
@@ -47,7 +47,29 @@ const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_TEMP),
   filename: (req, file, cb) => cb(null, Date.now() + '_' + Math.random().toString(36).slice(2,8) + path.extname(file.originalname))
 });
-const upload = multer({ storage, limits: { fileSize: 200 * 1024 * 1024 } }); // максимум 200 МБ
+const upload = multer({ storage, limits: { fileSize: 200 * 1024 * 1024 } });
+
+// ========== Поиск FFmpeg и FFprobe ==========
+function findBinary(name) {
+  // Проверяем переменную окружения
+  const envVar = process.env[name.toUpperCase() + '_PATH'];
+  if (envVar && fs.existsSync(envVar)) return envVar;
+  // Проверяем локальную папку ./bin
+  const localPath = path.join(__dirname, 'bin', name);
+  if (fs.existsSync(localPath)) return localPath;
+  // Проверяем системный PATH
+  try {
+    const which = require('child_process').execSync(`which ${name}`, { encoding: 'utf8' }).trim();
+    if (which && fs.existsSync(which)) return which;
+  } catch (e) {}
+  // Fallback
+  return name;
+}
+
+const FFMPEG_PATH = findBinary('ffmpeg');
+const FFPROBE_PATH = findBinary('ffprobe');
+console.log(`🔧 FFmpeg: ${FFMPEG_PATH}`);
+console.log(`🔧 FFprobe: ${FFPROBE_PATH}`);
 
 // Проверка токена SkyID
 async function verifySkyToken(token) {
@@ -71,7 +93,7 @@ function authMiddleware(req, res, next) {
 // ========== Healthix ==========
 app.get('/healthix', (req, res) => res.json({ status: 'ok', service: 'skyvideo' }));
 
-// ========== OAuth Client (SkyVideo) ==========
+// ========== OAuth Client ==========
 app.get('/auth/login', (req, res) => {
   const clientId = 'skyvideo';
   const scope = req.query.scope || 'profile email';
@@ -130,7 +152,7 @@ app.put('/profile', authMiddleware, (req, res) => {
   res.json(profile);
 });
 
-// ========== Конфигурация качества видео ==========
+// ========== Конфигурация качества ==========
 const QUALITY_CONFIGS = [
   { label: '1080p', width: 1920, height: 1080, bitrate: '4000k', maxrate: '4000k', bufsize: '8000k' },
   { label: '720p',  width: 1280, height: 720,  bitrate: '2000k', maxrate: '2000k', bufsize: '4000k' },
@@ -138,25 +160,23 @@ const QUALITY_CONFIGS = [
   { label: '360p',  width: 640,  height: 360,  bitrate: '500k',  maxrate: '500k',  bufsize: '1000k' }
 ];
 
-// ========== Загрузка видео с HLS-генерацией ==========
+// ========== Загрузка видео ==========
 app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => {
   try {
     const file = req.file;
     if (!file) return res.status(400).json({ error: 'No video file' });
-    
     const videoId = 'vid_' + Date.now();
     const originalPath = file.path;
     const { title, description, tags } = req.body;
     const tagArray = tags ? tags.split(',').map(t => t.trim()).filter(Boolean) : [];
 
-    // Создаём папку для HLS
     const hlsVideoDir = path.join(HLS_DIR, videoId);
     if (!fs.existsSync(hlsVideoDir)) fs.mkdirSync(hlsVideoDir, { recursive: true });
 
-    // Определяем реальное разрешение видео (получаем через ffprobe)
+    // Получаем разрешение видео через ffprobe
     let videoWidth = 1920, videoHeight = 1080;
     try {
-      const probe = spawn('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', originalPath]);
+      const probe = spawn(FFPROBE_PATH, ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', originalPath]);
       const output = await new Promise((resolve, reject) => {
         let data = '';
         probe.stdout.on('data', chunk => data += chunk);
@@ -167,14 +187,11 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
       if (w && h) { videoWidth = w; videoHeight = h; }
     } catch (e) { console.warn('Could not probe video, using default 1080p'); }
 
-    // Фильтруем качества, которые не превышают исходное разрешение
     const validQualities = QUALITY_CONFIGS.filter(q => q.width <= videoWidth && q.height <= videoHeight);
     if (validQualities.length === 0) {
-      // Если видео меньше 360p, добавляем одно качество с оригинальным разрешением
       validQualities.push({ label: 'original', width: videoWidth, height: videoHeight, bitrate: '1500k', maxrate: '1500k', bufsize: '3000k' });
     }
 
-    // Генерируем HLS-сегменты для каждого качества
     const variantStreams = [];
     for (const quality of validQualities) {
       const qualityDir = path.join(hlsVideoDir, quality.label);
@@ -183,14 +200,13 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
       const playlistPath = path.join(qualityDir, 'playlist.m3u8');
       const segmentPattern = path.join(qualityDir, 'segment_%03d.ts');
 
-      // Команда FFmpeg для создания HLS
       const ffmpegArgs = [
         '-i', originalPath,
         '-c:v', 'libx264',
         '-b:v', quality.bitrate,
         '-maxrate', quality.maxrate,
         '-bufsize', quality.bufsize,
-        '-preset', 'veryfast', // можно изменить на faster/medium для лучшего качества
+        '-preset', 'veryfast',
         '-profile:v', 'high',
         '-vf', `scale=trunc(${quality.width}/2)*2:trunc(${quality.height}/2)*2`,
         '-c:a', 'aac',
@@ -203,13 +219,12 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
       ];
 
       await new Promise((resolve, reject) => {
-        const ff = spawn('ffmpeg', ffmpegArgs);
+        const ff = spawn(FFMPEG_PATH, ffmpegArgs);
         ff.stderr.on('data', d => console.log(d.toString()));
         ff.on('close', code => code === 0 ? resolve() : reject(new Error(`FFmpeg for ${quality.label} failed`)));
         ff.on('error', reject);
       });
 
-      // Сохраняем информацию о варианте
       variantStreams.push({
         label: quality.label,
         width: quality.width,
@@ -219,7 +234,6 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
       });
     }
 
-    // Генерируем мастер-плейлист (master.m3u8)
     let masterContent = '#EXTM3U\n#EXT-X-VERSION:3\n';
     for (const v of variantStreams) {
       const bitrateNum = parseInt(v.bitrate);
@@ -229,10 +243,8 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
     const masterPath = path.join(hlsVideoDir, 'master.m3u8');
     fs.writeFileSync(masterPath, masterContent);
 
-    // Удаляем оригинальный загруженный файл
     fs.unlinkSync(originalPath);
 
-    // Сохраняем метаданные
     const meta = {
       id: videoId,
       title: title || 'Без названия',
@@ -257,7 +269,7 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
   }
 });
 
-// ========== HLS стриминг ==========
+// ========== HLS endpoints ==========
 app.get('/video/:videoId/master.m3u8', (req, res) => {
   const { videoId } = req.params;
   const masterPath = path.join(HLS_DIR, videoId, 'master.m3u8');
@@ -282,15 +294,11 @@ app.get('/video/:videoId/:quality/:segment', (req, res) => {
   res.sendFile(segPath);
 });
 
-// ========== Старый MP4-стриминг (fallback) ==========
+// ========== Fallback MP4 ==========
 app.get('/video/:id', (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
-  // Если есть HLS, перенаправляем на мастер-плейлист
-  if (meta.hlsMaster) {
-    return res.redirect(meta.hlsMaster);
-  }
-  // Fallback к MP4 (если есть)
+  if (meta.hlsMaster) return res.redirect(meta.hlsMaster);
   const videoPath = path.join(VIDEO_DIR, meta.filename);
   if (!fs.existsSync(videoPath)) return res.status(404).json({ error: 'File not found' });
   const stat = fs.statSync(videoPath); const fileSize = stat.size;
@@ -309,14 +317,12 @@ app.get('/video/:id', (req, res) => {
   }
 });
 
-// ========== Метаданные ==========
+// ========== Остальные эндпоинты ==========
 app.get('/video/:id/meta', (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
   res.json(meta);
 });
-
-// ========== Лайки/дизлайки ==========
 app.post('/video/:id/like', authMiddleware, (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
@@ -335,8 +341,6 @@ app.post('/video/:id/dislike', authMiddleware, (req, res) => {
   dbPut('videos', req.params.id, meta);
   res.json({ likes: meta.likes.length, dislikes: meta.dislikes.length });
 });
-
-// ========== Просмотры ==========
 app.post('/video/:id/view', (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
@@ -344,8 +348,6 @@ app.post('/video/:id/view', (req, res) => {
   dbPut('videos', req.params.id, meta);
   res.json({ views: meta.views });
 });
-
-// ========== Комментарии ==========
 app.get('/video/:id/comments', (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
@@ -381,16 +383,12 @@ app.delete('/video/:id/comment/:commentId', authMiddleware, (req, res) => {
   dbPut('videos', req.params.id, meta);
   res.json({ ok: true });
 });
-
-// ========== Администрирование ==========
 app.delete('/video/:id', authMiddleware, (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
   if (meta.skyid !== req.user.skyid && !req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
-  // Удаляем HLS-файлы
   const hlsDir = path.join(HLS_DIR, req.params.id);
   if (fs.existsSync(hlsDir)) fs.rmSync(hlsDir, { recursive: true, force: true });
-  // Удаляем MP4, если есть
   if (meta.filename) {
     const videoPath = path.join(VIDEO_DIR, meta.filename);
     if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
@@ -411,8 +409,6 @@ app.post('/admin/unban', authMiddleware, (req, res) => {
   dbDelete('bans', skyid);
   res.json({ ok: true });
 });
-
-// ========== Список и поиск ==========
 app.get('/list', (req, res) => {
   const ids = dbList('videos');
   const videos = ids.map(id => dbGet('videos', id)).filter(Boolean).sort((a,b) => b.created - a.created);
@@ -431,8 +427,6 @@ app.get('/search', (req, res) => {
   }
   res.json(results.sort((a,b) => b.created - a.created));
 });
-
-// ========== Проверка токена ==========
 app.get('/verify', authMiddleware, (req, res) => {
   res.json({ user: req.user, isAdmin: req.isAdmin });
 });
