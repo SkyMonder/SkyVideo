@@ -9,8 +9,6 @@ const multer = require('multer');
 const { spawn } = require('child_process');
 const compression = require('compression');
 const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const NodeCache = require('node-cache');
 
 const app = express();
 
@@ -18,62 +16,31 @@ const app = express();
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(compression());
 
-// ====== Раздача статики (с отключением кеша для HTML) ======
-app.use(express.static(path.join(__dirname, 'public'), {
-  maxAge: '1d',
-  setHeaders: (res, filePath) => {
-    if (filePath.endsWith('.html')) {
-      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-    }
-  }
-}));
-
-// ====== Лимиты запросов ======
-const uploadLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  message: 'Слишком много загрузок, попробуйте позже'
-});
-app.use('/upload', uploadLimiter);
-
-// ====== КОРС – ЯВНО УСТАНАВЛИВАЕМ ЗАГОЛОВКИ ======
+// ====== CORS ======
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-upload-token']
 }));
-// Принудительная установка заголовков на все ответы (даже при ошибках)
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-upload-token');
-  // Если это preflight-запрос, отвечаем сразу
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
-  next();
-});
-app.options('*', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-upload-token');
-  res.sendStatus(200);
-});
+app.options('*', cors());
 
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // ====== Глобальная обработка ошибок ======
 process.on('uncaughtException', (err) => {
-  console.error('💥 Необработанное исключение:', err);
+  console.error('💥 Uncaught Exception:', err.message);
+  console.error(err.stack);
 });
 process.on('unhandledRejection', (err) => {
-  console.error('💥 Необработанный reject:', err);
+  console.error('💥 Unhandled Rejection:', err.message);
+  console.error(err.stack);
 });
 
 const PORT = process.env.PORT || 3000;
 const SKYID_URL = process.env.SKYID_URL || 'https://skymutant.onrender.com';
 const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'SkyMonder';
+const HF_API_KEY = process.env.HF_API_KEY || null; // опционально
 
 // ====== Админ-панель (отдельный логин) ======
 const ADMIN_PANEL_USER = process.env.ADMIN_PANEL_USER || 'QUEUUOENGO_28937YAG';
@@ -84,45 +51,10 @@ const DATA_DIR = path.join(__dirname, 'data');
 const VIDEO_DIR = path.join(__dirname, 'videos');
 const UPLOAD_TEMP = path.join(__dirname, 'uploads');
 const THUMB_DIR = path.join(VIDEO_DIR, 'thumbnails');
-[VIDEO_DIR, UPLOAD_TEMP, DATA_DIR, THUMB_DIR].forEach(d => {
+const HLS_DIR = path.join(VIDEO_DIR, 'hls');
+[VIDEO_DIR, UPLOAD_TEMP, DATA_DIR, THUMB_DIR, HLS_DIR].forEach(d => {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 });
-
-// ====== Кеш для метаданных ======
-const metaCache = new NodeCache({ stdTTL: 600, checkperiod: 120 });
-
-// ====== Семафор для ограничения параллельных задач (1 процесс FFmpeg) ======
-class Semaphore {
-  constructor(max) {
-    this.max = max;
-    this.count = 0;
-    this.queue = [];
-  }
-  async acquire() {
-    if (this.count < this.max) {
-      this.count++;
-      return;
-    }
-    await new Promise(resolve => this.queue.push(resolve));
-    this.count++;
-  }
-  release() {
-    this.count--;
-    if (this.queue.length > 0) {
-      const resolve = this.queue.shift();
-      resolve();
-    }
-  }
-  async run(task) {
-    await this.acquire();
-    try {
-      return await task();
-    } finally {
-      this.release();
-    }
-  }
-}
-const semaphore = new Semaphore(1);
 
 // ====== Файловая БД ======
 function dbPut(bucket, key, data) {
@@ -152,23 +84,17 @@ const storage = multer.diskStorage({
 });
 const upload = multer({
   storage,
-  limits: {
-    fileSize: 100 * 1024 * 1024,
-    fieldSize: 50 * 1024 * 1024,
-  }
+  limits: { fileSize: 100 * 1024 * 1024, fieldSize: 50 * 1024 * 1024 }
 });
-
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
-    if (err.code === 'LIMIT_FILE_SIZE') {
-      return res.status(413).json({ error: 'Файл слишком большой (максимум 100 МБ)' });
-    }
+    if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'Файл слишком большой (максимум 100 МБ)' });
     return res.status(400).json({ error: err.message });
   }
   next(err);
 });
 
-// ====== Модерация (локальный список) ======
+// ====== Модерация (ИИ + локальный список) ======
 const BAD_WORDS = [
   'идиот', 'дебил', 'тупой', 'лох', 'дурак', 'кретин', 'урод',
   'ублюдок', 'сволочь', 'тварь', 'сука', 'блядь', 'хуй', 'пизда',
@@ -181,7 +107,27 @@ function containsBadWords(text) {
   const lower = text.toLowerCase();
   return BAD_WORDS.some(word => lower.includes(word));
 }
+
 async function checkAI(text) {
+  if (HF_API_KEY) {
+    try {
+      const res = await axios.post(
+        'https://api-inference.huggingface.co/models/Nelera/ru-toxicity-detection',
+        { inputs: text },
+        {
+          headers: { Authorization: `Bearer ${HF_API_KEY}` },
+          timeout: 5000
+        }
+      );
+      const result = res.data[0] || {};
+      const isToxic = result.label === 'LABEL_1';
+      const score = result.score || 0;
+      const local = containsBadWords(text);
+      return { toxic: isToxic || local, score: Math.max(score, local ? 1 : 0) };
+    } catch (e) {
+      console.error('⚠️ Ошибка ИИ-модерации:', e.message);
+    }
+  }
   return { toxic: containsBadWords(text), score: containsBadWords(text) ? 1 : 0 };
 }
 
@@ -194,14 +140,11 @@ function banUserWithDuration(skyid, reason, days = 2) {
 function isUserBanned(skyid) {
   const ban = dbGet('bans', skyid);
   if (!ban) return false;
-  if (ban.until && Date.now() > ban.until) {
-    dbDelete('bans', skyid);
-    return false;
-  }
+  if (ban.until && Date.now() > ban.until) { dbDelete('bans', skyid); return false; }
   return true;
 }
 
-// ====== Аутентификация через SkyID ======
+// ====== Auth ======
 async function verifySkyToken(token) {
   try {
     const res = await axios.get(`${SKYID_URL}/me`, { headers: { Authorization: `Bearer ${token}` } });
@@ -258,7 +201,11 @@ app.get('/auth/callback', async (req, res) => {
   const { code } = req.query;
   if (!code) return res.status(400).send('Missing code');
   try {
-    const tokenRes = await axios.post(`${SKYID_URL}/oauth/token`, { code, client_id: 'skyvideo', client_secret: 'skyvideo_secret' });
+    const tokenRes = await axios.post(`${SKYID_URL}/oauth/token`, {
+      code,
+      client_id: 'skyvideo',
+      client_secret: 'skyvideo_secret'
+    });
     const { access_token, skyid, login } = tokenRes.data;
     res.redirect(`/auth/success?token=${access_token}&skyid=${skyid}&login=${login}`);
   } catch (e) {
@@ -270,17 +217,14 @@ app.get('/auth/success', (req, res) => {
   const { token, skyid, login } = req.query;
   res.send(`
     <!DOCTYPE html>
-    <html>
-    <head><meta charset="UTF-8"><title>Успешный вход</title></head>
-    <body>
+    <html><head><meta charset="UTF-8"><title>Успешный вход</title></head><body>
       <script>
         localStorage.setItem('skyvideo_token', '${token}');
         localStorage.setItem('skyvideo_skyid', '${skyid}');
         localStorage.setItem('skyvideo_login', '${login}');
         window.location.href = '/';
       </script>
-    </body>
-    </html>
+    </body></html>
   `);
 });
 
@@ -297,56 +241,130 @@ app.put('/profile', authMiddleware, (req, res) => {
   res.json(profile);
 });
 
-// ====== Генерация превью (отключена) ======
+// ====== Генерация превью ======
 async function generateThumbnail(videoId, videoPath) {
-  console.warn('⚠️ Превью отключено для экономии памяти');
-  return null;
+  const thumbPath = path.join(THUMB_DIR, videoId + '.jpg');
+  try {
+    await new Promise((resolve, reject) => {
+      const ff = spawn('ffmpeg', [
+        '-i', videoPath,
+        '-ss', '00:00:01',
+        '-vframes', '1',
+        '-vf', 'scale=320:180',
+        '-q:v', '2',
+        '-y',
+        thumbPath
+      ]);
+      ff.on('close', code => code === 0 ? resolve() : reject(new Error(`FFmpeg exited with ${code}`)));
+      ff.on('error', reject);
+    });
+    console.log(`✅ Превью создано для ${videoId}`);
+    return `/thumbnails/${videoId}.jpg`;
+  } catch (e) {
+    console.error(`❌ Ошибка генерации превью для ${videoId}:`, e.message);
+    return null;
+  }
 }
 
-// ====== Фоновая обработка видео ======
+// ====== Фоновая обработка видео (HLS) ======
 async function processVideoInBackground(videoId, originalPath) {
-  await semaphore.run(async () => {
-    console.log(`🔄 Обработка видео ${videoId} начата`);
-    try {
-      const meta = dbGet('videos', videoId);
-      if (!meta) throw new Error('Video not found');
-      const outputDir = path.join(VIDEO_DIR, 'processed');
-      if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
-      const outputPath = path.join(outputDir, videoId + '.mp4');
-      const ffmpegArgs = [
-        '-i', originalPath,
-        '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-crf', '30',
-        '-vf', 'scale=854:480',
-        '-c:a', 'aac',
-        '-b:a', '96k',
-        '-movflags', '+faststart',
-        outputPath
-      ];
+  console.log(`🔄 Начинаем обработку видео ${videoId}`);
+  try {
+    const meta = dbGet('videos', videoId);
+    if (!meta) throw new Error('Video not found');
+
+    const videoHlsDir = path.join(HLS_DIR, videoId);
+    if (!fs.existsSync(videoHlsDir)) fs.mkdirSync(videoHlsDir, { recursive: true });
+
+    // Качества
+    const qualities = [
+      { label: '360p', width: 640, height: 360, bitrate: '500k' },
+      { label: '480p', width: 854, height: 480, bitrate: '1000k' },
+      { label: '720p', width: 1280, height: 720, bitrate: '2000k' }
+    ];
+
+    const playlists = [];
+    for (const q of qualities) {
+      const outDir = path.join(videoHlsDir, q.label);
+      if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+      const playlistPath = path.join(outDir, 'playlist.m3u8');
+      const segPattern = path.join(outDir, 'segment_%03d.ts');
+
       await new Promise((resolve, reject) => {
-        const ff = spawn('ffmpeg', ffmpegArgs);
+        const ff = spawn('ffmpeg', [
+          '-i', originalPath,
+          '-c:v', 'libx264',
+          '-b:v', q.bitrate,
+          '-maxrate', q.bitrate,
+          '-bufsize', q.bitrate,
+          '-preset', 'veryfast',
+          '-profile:v', 'high',
+          '-vf', `scale=trunc(${q.width}/2)*2:trunc(${q.height}/2)*2`,
+          '-c:a', 'aac',
+          '-b:a', '128k',
+          '-f', 'hls',
+          '-hls_time', '6',
+          '-hls_playlist_type', 'vod',
+          '-hls_segment_filename', segPattern,
+          playlistPath
+        ]);
         ff.stderr.on('data', d => console.log(d.toString()));
-        ff.on('close', code => code === 0 ? resolve() : reject(new Error(`FFmpeg exited with ${code}`)));
+        ff.on('close', code => code === 0 ? resolve() : reject(new Error(`FFmpeg for ${q.label} failed`)));
         ff.on('error', reject);
       });
-      meta.filename = 'processed/' + videoId + '.mp4';
-      meta.status = 'ready';
-      dbPut('videos', videoId, meta);
-      metaCache.set(videoId, meta);
-      console.log(`✅ Видео ${videoId} обработано`);
-      if (fs.existsSync(originalPath)) fs.unlinkSync(originalPath);
-    } catch (err) {
-      console.error(`❌ Ошибка обработки видео ${videoId}:`, err.message);
-      const meta = dbGet('videos', videoId);
-      if (meta) {
-        meta.status = 'failed';
-        dbPut('videos', videoId, meta);
-        metaCache.set(videoId, meta);
-      }
-      if (fs.existsSync(originalPath)) fs.unlinkSync(originalPath);
+      playlists.push({
+        label: q.label,
+        width: q.width,
+        height: q.height,
+        bitrate: q.bitrate,
+        playlist: `/video/${videoId}/${q.label}/playlist.m3u8`
+      });
     }
-  });
+
+    // Мастер-плейлист
+    let master = '#EXTM3U\n#EXT-X-VERSION:3\n';
+    for (const p of playlists) {
+      const bitrateNum = parseInt(p.bitrate);
+      master += `#EXT-X-STREAM-INF:BANDWIDTH=${bitrateNum*1000},RESOLUTION=${p.width}x${p.height}\n${p.playlist}\n`;
+    }
+    const masterPath = path.join(videoHlsDir, 'master.m3u8');
+    fs.writeFileSync(masterPath, master);
+
+    // Удаляем оригинал
+    if (fs.existsSync(originalPath)) fs.unlinkSync(originalPath);
+
+    // Обновляем метаданные
+    meta.status = 'ready';
+    meta.hlsMaster = `/video/${videoId}/master.m3u8`;
+    meta.qualities = playlists.map(p => ({
+      label: p.label,
+      width: p.width,
+      height: p.height,
+      bitrate: p.bitrate
+    }));
+    dbPut('videos', videoId, meta);
+
+    // Генерируем превью (используем первый сегмент или оригинал? оригинал уже удалён, но можно использовать сегмент)
+    // Лучше сгенерировать превью из первого сегмента, но для простоты пропустим или используем сохранённый ранее.
+    // Попробуем использовать первый сегмент как источник
+    const firstSeg = path.join(videoHlsDir, '360p', 'segment_000.ts');
+    if (fs.existsSync(firstSeg)) {
+      const thumbUrl = await generateThumbnail(videoId, firstSeg);
+      if (thumbUrl) {
+        meta.thumbnail = thumbUrl;
+        dbPut('videos', videoId, meta);
+      }
+    }
+    console.log(`✅ Видео ${videoId} обработано`);
+  } catch (err) {
+    console.error(`❌ Ошибка обработки видео ${videoId}:`, err.message);
+    const meta = dbGet('videos', videoId);
+    if (meta) {
+      meta.status = 'failed';
+      dbPut('videos', videoId, meta);
+    }
+    if (fs.existsSync(originalPath)) fs.unlinkSync(originalPath);
+  }
 }
 
 // ====== Загрузка видео ======
@@ -359,6 +377,7 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
     const { title, description, tags } = req.body;
     const tagArray = tags ? tags.split(',').map(t => t.trim()).filter(Boolean) : [];
 
+    // ИИ-модерация
     const fullText = title + ' ' + description + ' ' + tagArray.join(' ');
     const aiResult = await checkAI(fullText);
     if (aiResult.toxic) {
@@ -367,6 +386,7 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
       return res.status(403).json({ error: 'Ваше видео содержит неприемлемый контент. Вы забанены на 2 дня.' });
     }
 
+    // Сохраняем метаданные (в процессе)
     const meta = {
       id: videoId,
       title: title || 'Без названия',
@@ -385,11 +405,12 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
       mimetype: file.mimetype || 'video/mp4',
       duration: 0,
       thumbnail: null,
-      moderated: true
+      hlsMaster: null,
+      qualities: []
     };
     dbPut('videos', videoId, meta);
-    metaCache.set(videoId, meta);
 
+    // Запускаем обработку в фоне
     processVideoInBackground(videoId, videoPath);
 
     res.json({ ok: true, videoId, status: 'processing' });
@@ -402,91 +423,48 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
   }
 });
 
-// ====== РАЗДАЧА ПРЕВЬЮ ======
+// ====== Раздача превью ======
 app.get('/thumbnails/:filename', (req, res) => {
   const thumbPath = path.join(THUMB_DIR, req.params.filename);
-  if (!fs.existsSync(thumbPath)) {
-    console.warn(`⚠️ Превью не найдено: ${thumbPath}`);
-    return res.status(404).json({ error: 'Thumbnail not found' });
-  }
-  res.sendFile(thumbPath, (err) => {
-    if (err) {
-      console.error('❌ Ошибка отправки превью:', err);
-      if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
-    }
-  });
+  if (!fs.existsSync(thumbPath)) return res.status(404).json({ error: 'Not found' });
+  res.sendFile(thumbPath);
 });
 
-// ====== СТРИМИНГ ВИДЕО ======
-app.get('/video/:id', (req, res) => {
-  const meta = dbGet('videos', req.params.id);
-  if (!meta) {
-    console.warn(`⚠️ Видео ${req.params.id} не найдено в БД`);
-    return res.status(404).json({ error: 'Video not found' });
-  }
-  if (meta.status !== 'ready') {
-    // Возвращаем 202 с явными CORS-заголовками (они уже устанавливаются middleware)
-    return res.status(202).json({ error: 'Video is still processing' });
-  }
-  const videoPath = path.join(VIDEO_DIR, meta.filename);
-  if (!fs.existsSync(videoPath)) {
-    console.warn(`⚠️ Файл видео не найден: ${videoPath}`);
-    return res.status(404).json({ error: 'File not found' });
-  }
-  const stat = fs.statSync(videoPath);
-  const fileSize = stat.size;
-  const range = req.headers.range;
-  if (range) {
-    const parts = range.replace(/bytes=/, '').split('-');
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-    const chunksize = (end - start) + 1;
-    const fileStream = fs.createReadStream(videoPath, { start, end });
-    res.writeHead(206, {
-      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-      'Accept-Ranges': 'bytes',
-      'Content-Length': chunksize,
-      'Content-Type': meta.mimetype || 'video/mp4',
-    });
-    fileStream.pipe(res);
-    fileStream.on('error', (err) => {
-      console.error('❌ Ошибка стриминга:', err);
-      if (!res.headersSent) res.status(500).json({ error: 'Streaming error' });
-    });
-  } else {
-    res.writeHead(200, {
-      'Content-Length': fileSize,
-      'Content-Type': meta.mimetype || 'video/mp4',
-    });
-    fs.createReadStream(videoPath).pipe(res);
-  }
+// ====== HLS endpoints ======
+app.get('/video/:videoId/master.m3u8', (req, res) => {
+  const masterPath = path.join(HLS_DIR, req.params.videoId, 'master.m3u8');
+  if (!fs.existsSync(masterPath)) return res.status(404).send('Master playlist not found');
+  res.set('Content-Type', 'application/vnd.apple.mpegurl');
+  res.sendFile(masterPath);
+});
+app.get('/video/:videoId/:quality/playlist.m3u8', (req, res) => {
+  const playlistPath = path.join(HLS_DIR, req.params.videoId, req.params.quality, 'playlist.m3u8');
+  if (!fs.existsSync(playlistPath)) return res.status(404).send('Playlist not found');
+  res.set('Content-Type', 'application/vnd.apple.mpegurl');
+  res.sendFile(playlistPath);
+});
+app.get('/video/:videoId/:quality/:segment', (req, res) => {
+  const segPath = path.join(HLS_DIR, req.params.videoId, req.params.quality, req.params.segment);
+  if (!fs.existsSync(segPath)) return res.status(404).send('Segment not found');
+  res.set('Content-Type', 'video/MP2T');
+  res.sendFile(segPath);
 });
 
 // ====== Статус ======
 app.get('/video/:id/status', (req, res) => {
-  const meta = getCachedMeta(req.params.id);
+  const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
-  res.json({ status: meta.status });
+  res.json({ status: meta.status, hlsMaster: meta.hlsMaster });
 });
-
-// ====== Кешированное получение метаданных ======
-function getCachedMeta(videoId) {
-  let meta = metaCache.get(videoId);
-  if (!meta) {
-    meta = dbGet('videos', videoId);
-    if (meta) metaCache.set(videoId, meta);
-  }
-  return meta;
-}
 
 // ====== Метаданные ======
 app.get('/video/:id/meta', (req, res) => {
-  const meta = getCachedMeta(req.params.id);
+  const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
   res.json(meta);
 });
 
-// ====== Лайки, комментарии, просмотры ======
+// ====== Лайки ======
 app.post('/video/:id/like', authMiddleware, (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
@@ -494,7 +472,6 @@ app.post('/video/:id/like', authMiddleware, (req, res) => {
   if (!meta.likes.includes(req.user.skyid)) meta.likes.push(req.user.skyid);
   else meta.likes = meta.likes.filter(u => u !== req.user.skyid);
   dbPut('videos', req.params.id, meta);
-  metaCache.set(req.params.id, meta);
   res.json({ likes: meta.likes.length, dislikes: meta.dislikes.length });
 });
 app.post('/video/:id/dislike', authMiddleware, (req, res) => {
@@ -504,21 +481,21 @@ app.post('/video/:id/dislike', authMiddleware, (req, res) => {
   if (!meta.dislikes.includes(req.user.skyid)) meta.dislikes.push(req.user.skyid);
   else meta.dislikes = meta.dislikes.filter(u => u !== req.user.skyid);
   dbPut('videos', req.params.id, meta);
-  metaCache.set(req.params.id, meta);
   res.json({ likes: meta.likes.length, dislikes: meta.dislikes.length });
 });
+
+// ====== Просмотры ======
 app.post('/video/:id/view', (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
   meta.views = (meta.views || 0) + 1;
   dbPut('videos', req.params.id, meta);
-  metaCache.set(req.params.id, meta);
   res.json({ views: meta.views });
 });
 
 // ====== Комментарии ======
 app.get('/video/:id/comments', (req, res) => {
-  const meta = getCachedMeta(req.params.id);
+  const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
   res.json(meta.comments || []);
 });
@@ -527,15 +504,16 @@ app.post('/video/:id/comment', authMiddleware, async (req, res) => {
   if (!meta) return res.status(404).json({ error: 'Not found' });
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: 'Text required' });
+
   const aiResult = await checkAI(text);
   if (aiResult.toxic) {
     banUserWithDuration(req.user.skyid, 'Токсичный комментарий');
     return res.status(403).json({ error: 'Ваш комментарий содержит неприемлемый контент. Вы забанены на 2 дня.' });
   }
+
   const comment = { id: 'cmt_' + Date.now(), skyid: req.user.skyid, author: req.user.login, text, created: Date.now() };
   meta.comments.push(comment);
   dbPut('videos', req.params.id, meta);
-  metaCache.set(req.params.id, meta);
   res.json(comment);
 });
 app.put('/video/:id/comment/:commentId', authMiddleware, async (req, res) => {
@@ -544,14 +522,15 @@ app.put('/video/:id/comment/:commentId', authMiddleware, async (req, res) => {
   const comment = meta.comments.find(c => c.id === req.params.commentId);
   if (!comment) return res.status(404).json({ error: 'Comment not found' });
   if (comment.skyid !== req.user.skyid && !req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
+
   const aiResult = await checkAI(req.body.text);
   if (aiResult.toxic) {
     banUserWithDuration(req.user.skyid, 'Токсичный комментарий (редактирование)');
     return res.status(403).json({ error: 'Ваш комментарий содержит неприемлемый контент. Вы забанены на 2 дня.' });
   }
+
   comment.text = req.body.text;
   dbPut('videos', req.params.id, meta);
-  metaCache.set(req.params.id, meta);
   res.json(comment);
 });
 app.delete('/video/:id/comment/:commentId', authMiddleware, (req, res) => {
@@ -562,7 +541,6 @@ app.delete('/video/:id/comment/:commentId', authMiddleware, (req, res) => {
   if (comment.skyid !== req.user.skyid && !req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
   meta.comments = meta.comments.filter(c => c.id !== req.params.commentId);
   dbPut('videos', req.params.id, meta);
-  metaCache.set(req.params.id, meta);
   res.json({ ok: true });
 });
 
@@ -571,12 +549,12 @@ app.delete('/video/:id', authMiddleware, (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
   if (meta.authorSkyid !== req.user.skyid && !req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
-  const videoPath = path.join(VIDEO_DIR, meta.filename);
-  if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+  // Удаляем HLS и превью
+  const hlsDir = path.join(HLS_DIR, req.params.id);
+  if (fs.existsSync(hlsDir)) fs.rmSync(hlsDir, { recursive: true, force: true });
   const thumbPath = path.join(THUMB_DIR, meta.id + '.jpg');
   if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
   dbDelete('videos', req.params.id);
-  metaCache.del(req.params.id);
   res.json({ ok: true });
 });
 
@@ -608,7 +586,9 @@ app.get('/follow/followers/:skyid', (req, res) => {
   const followers = [];
   for (const id of allFollows) {
     const data = dbGet('follows', id);
-    if (data && data.following.includes(targetSkyid)) followers.push(id);
+    if (data && data.following.includes(targetSkyid)) {
+      followers.push(id);
+    }
   }
   res.json({ followers });
 });
@@ -863,12 +843,11 @@ app.get('/admin/videos', adminAuthMiddleware, (req, res) => {
 app.delete('/admin/video/:videoId', adminAuthMiddleware, (req, res) => {
   const meta = dbGet('videos', req.params.videoId);
   if (!meta) return res.status(404).json({ error: 'Not found' });
-  const videoPath = path.join(VIDEO_DIR, meta.filename);
-  if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+  const hlsDir = path.join(HLS_DIR, req.params.videoId);
+  if (fs.existsSync(hlsDir)) fs.rmSync(hlsDir, { recursive: true, force: true });
   const thumbPath = path.join(THUMB_DIR, meta.id + '.jpg');
   if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
   dbDelete('videos', req.params.videoId);
-  metaCache.del(req.params.videoId);
   res.json({ ok: true });
 });
 
@@ -879,7 +858,6 @@ app.delete('/admin/comment/:videoId/:commentId', adminAuthMiddleware, (req, res)
   if (!comment) return res.status(404).json({ error: 'Comment not found' });
   meta.comments = meta.comments.filter(c => c.id !== req.params.commentId);
   dbPut('videos', req.params.videoId, meta);
-  metaCache.set(req.params.videoId, meta);
   res.json({ ok: true });
 });
 
@@ -923,7 +901,9 @@ app.get('/search', (req, res) => {
   for (const id of ids) {
     const meta = dbGet('videos', id);
     if (!meta) continue;
-    if (meta.title.toLowerCase().includes(q) || meta.description.toLowerCase().includes(q) || meta.tags.some(t => t.toLowerCase().includes(q))) {
+    if (meta.title.toLowerCase().includes(q) ||
+        meta.description.toLowerCase().includes(q) ||
+        meta.tags.some(t => t.toLowerCase().includes(q))) {
       results.push(meta);
     }
   }
@@ -935,7 +915,7 @@ app.get('/verify', authMiddleware, (req, res) => {
   res.json({ user: req.user, isAdmin: req.isAdmin });
 });
 
-// ====== Запуск сервера ======
+// ====== Запуск ======
 const server = http.createServer(app);
 server.timeout = 30 * 60 * 1000;
 server.keepAliveTimeout = 30 * 60 * 1000;
@@ -943,6 +923,6 @@ server.headersTimeout = 60 * 60 * 1000;
 
 server.listen(PORT, () => {
   console.log(`🚀 SkyVideo running on port ${PORT}`);
-  console.log(`⚡ Оптимизации: кеш, сжатие, лимиты, 1 поток конвертации`);
-  console.log(`📁 Статика раздаётся из папки public`);
+  console.log(`⚡ Полный функционал: ИИ, FFmpeg, HLS, превью`);
+  console.log(`🤖 ИИ-модерация ${HF_API_KEY ? 'активна' : 'отключена (локальный список)'}`);
 });
