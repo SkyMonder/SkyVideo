@@ -43,8 +43,8 @@ const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'SkyMonder';
 const HF_API_KEY = process.env.HF_API_KEY || null; // опционально
 
 // ====== Админ-панель (отдельный логин) ======
-const ADMIN_PANEL_USER = process.env.ADMIN_PANEL_USER || 'QUEUUOENGO_28937YAG';
-const ADMIN_PANEL_PASS = process.env.ADMIN_PANEL_PASS || 'BYOSOGB45BGWO45G7_34F';
+const ADMIN_PANEL_USER = process.env.ADMIN_PANEL_USER;
+const ADMIN_PANEL_PASS = process.env.ADMIN_PANEL_PASS;
 
 // ====== Директории ======
 const DATA_DIR = path.join(__dirname, 'data');
