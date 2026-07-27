@@ -12,15 +12,28 @@ const helmet = require('helmet');
 
 const app = express();
 
+// ====== МИДЛВЕР ДЛЯ ПРИНУДИТЕЛЬНЫХ CORS-ЗАГОЛОВКОВ (ДО ВСЕХ МАРШРУТОВ) ======
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-upload-token, Origin, Accept');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 // ====== Защита и сжатие ======
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(compression());
 
-// ====== CORS ======
+// ====== CORS (дублируем для надёжности) ======
 app.use(cors({
   origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-upload-token']
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-upload-token', 'Origin', 'Accept'],
+  credentials: true
 }));
 app.options('*', cors());
 
@@ -40,11 +53,11 @@ process.on('unhandledRejection', (err) => {
 const PORT = process.env.PORT || 3000;
 const SKYID_URL = process.env.SKYID_URL || 'https://skymutant.onrender.com';
 const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'SkyMonder';
-const HF_API_KEY = process.env.HF_API_KEY || null; // опционально
+const HF_API_KEY = process.env.HF_API_KEY || null;
 
-// ====== Админ-панель (отдельный логин) ======
-const ADMIN_PANEL_USER = process.env.ADMIN_PANEL_USER;
-const ADMIN_PANEL_PASS = process.env.ADMIN_PANEL_PASS;
+// ====== Админ-панель ======
+const ADMIN_PANEL_USER = process.env.ADMIN_PANEL_USER || 'QUEUUOENGO_28937YAG';
+const ADMIN_PANEL_PASS = process.env.ADMIN_PANEL_PASS || 'BYOSOGB45BGWO45G7_34F';
 
 // ====== Директории ======
 const DATA_DIR = path.join(__dirname, 'data');
@@ -94,31 +107,20 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-// ====== Модерация (ИИ + локальный список) ======
-const BAD_WORDS = [
-  'идиот', 'дебил', 'тупой', 'лох', 'дурак', 'кретин', 'урод',
-  'ублюдок', 'сволочь', 'тварь', 'сука', 'блядь', 'хуй', 'пизда',
-  'залупа', 'мудак', 'редиска', 'спам', 'бан', 'мат', 'оскорбление',
-  'нецензурная', 'порно', 'наркотики', 'взлом', 'мошенничество', 'скам', 'фишинг'
-];
-
+// ====== Модерация ======
+const BAD_WORDS = ['идиот', 'дебил', 'тупой', 'лох', 'дурак', 'кретин', 'урод', 'ублюдок', 'сволочь', 'тварь', 'сука', 'блядь', 'хуй', 'пизда', 'залупа', 'мудак', 'редиска', 'спам', 'бан', 'мат', 'оскорбление', 'нецензурная', 'порно', 'наркотики', 'взлом', 'мошенничество', 'скам', 'фишинг'];
 function containsBadWords(text) {
   if (!text) return false;
   const lower = text.toLowerCase();
   return BAD_WORDS.some(word => lower.includes(word));
 }
-
 async function checkAI(text) {
   if (HF_API_KEY) {
     try {
-      const res = await axios.post(
-        'https://api-inference.huggingface.co/models/Nelera/ru-toxicity-detection',
-        { inputs: text },
-        {
-          headers: { Authorization: `Bearer ${HF_API_KEY}` },
-          timeout: 5000
-        }
-      );
+      const res = await axios.post('https://api-inference.huggingface.co/models/Nelera/ru-toxicity-detection', { inputs: text }, {
+        headers: { Authorization: `Bearer ${HF_API_KEY}` },
+        timeout: 5000
+      });
       const result = res.data[0] || {};
       const isToxic = result.label === 'LABEL_1';
       const score = result.score || 0;
@@ -159,9 +161,7 @@ function authMiddleware(req, res, next) {
     if (isUserBanned(user.skyid)) {
       const ban = dbGet('bans', user.skyid);
       const remaining = Math.ceil((ban.until - Date.now()) / (1000 * 60 * 60));
-      return res.status(403).json({
-        error: `Вы забанены до ${new Date(ban.until).toLocaleString()}. Осталось ${remaining} часов.`
-      });
+      return res.status(403).json({ error: `Вы забанены до ${new Date(ban.until).toLocaleString()}. Осталось ${remaining} часов.` });
     }
     req.user = user;
     req.isAdmin = (user.login === ADMIN_LOGIN);
@@ -201,11 +201,7 @@ app.get('/auth/callback', async (req, res) => {
   const { code } = req.query;
   if (!code) return res.status(400).send('Missing code');
   try {
-    const tokenRes = await axios.post(`${SKYID_URL}/oauth/token`, {
-      code,
-      client_id: 'skyvideo',
-      client_secret: 'skyvideo_secret'
-    });
+    const tokenRes = await axios.post(`${SKYID_URL}/oauth/token`, { code, client_id: 'skyvideo', client_secret: 'skyvideo_secret' });
     const { access_token, skyid, login } = tokenRes.data;
     res.redirect(`/auth/success?token=${access_token}&skyid=${skyid}&login=${login}`);
   } catch (e) {
@@ -276,7 +272,6 @@ async function processVideoInBackground(videoId, originalPath) {
     const videoHlsDir = path.join(HLS_DIR, videoId);
     if (!fs.existsSync(videoHlsDir)) fs.mkdirSync(videoHlsDir, { recursive: true });
 
-    // Качества
     const qualities = [
       { label: '360p', width: 640, height: 360, bitrate: '500k' },
       { label: '480p', width: 854, height: 480, bitrate: '1000k' },
@@ -321,7 +316,6 @@ async function processVideoInBackground(videoId, originalPath) {
       });
     }
 
-    // Мастер-плейлист
     let master = '#EXTM3U\n#EXT-X-VERSION:3\n';
     for (const p of playlists) {
       const bitrateNum = parseInt(p.bitrate);
@@ -330,10 +324,8 @@ async function processVideoInBackground(videoId, originalPath) {
     const masterPath = path.join(videoHlsDir, 'master.m3u8');
     fs.writeFileSync(masterPath, master);
 
-    // Удаляем оригинал
     if (fs.existsSync(originalPath)) fs.unlinkSync(originalPath);
 
-    // Обновляем метаданные
     meta.status = 'ready';
     meta.hlsMaster = `/video/${videoId}/master.m3u8`;
     meta.qualities = playlists.map(p => ({
@@ -344,9 +336,6 @@ async function processVideoInBackground(videoId, originalPath) {
     }));
     dbPut('videos', videoId, meta);
 
-    // Генерируем превью (используем первый сегмент или оригинал? оригинал уже удалён, но можно использовать сегмент)
-    // Лучше сгенерировать превью из первого сегмента, но для простоты пропустим или используем сохранённый ранее.
-    // Попробуем использовать первый сегмент как источник
     const firstSeg = path.join(videoHlsDir, '360p', 'segment_000.ts');
     if (fs.existsSync(firstSeg)) {
       const thumbUrl = await generateThumbnail(videoId, firstSeg);
@@ -377,7 +366,6 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
     const { title, description, tags } = req.body;
     const tagArray = tags ? tags.split(',').map(t => t.trim()).filter(Boolean) : [];
 
-    // ИИ-модерация
     const fullText = title + ' ' + description + ' ' + tagArray.join(' ');
     const aiResult = await checkAI(fullText);
     if (aiResult.toxic) {
@@ -386,7 +374,6 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
       return res.status(403).json({ error: 'Ваше видео содержит неприемлемый контент. Вы забанены на 2 дня.' });
     }
 
-    // Сохраняем метаданные (в процессе)
     const meta = {
       id: videoId,
       title: title || 'Без названия',
@@ -410,7 +397,6 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
     };
     dbPut('videos', videoId, meta);
 
-    // Запускаем обработку в фоне
     processVideoInBackground(videoId, videoPath);
 
     res.json({ ok: true, videoId, status: 'processing' });
@@ -549,7 +535,6 @@ app.delete('/video/:id', authMiddleware, (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) return res.status(404).json({ error: 'Not found' });
   if (meta.authorSkyid !== req.user.skyid && !req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
-  // Удаляем HLS и превью
   const hlsDir = path.join(HLS_DIR, req.params.id);
   if (fs.existsSync(hlsDir)) fs.rmSync(hlsDir, { recursive: true, force: true });
   const thumbPath = path.join(THUMB_DIR, meta.id + '.jpg');
