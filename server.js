@@ -12,7 +12,7 @@ const helmet = require('helmet');
 
 const app = express();
 
-// ====== МИДЛВЕР ДЛЯ ПРИНУДИТЕЛЬНЫХ CORS-ЗАГОЛОВКОВ (ДО ВСЕХ МАРШРУТОВ) ======
+// ====== ПРИНУДИТЕЛЬНЫЕ CORS-ЗАГОЛОВКИ ДЛЯ ВСЕХ ОТВЕТОВ ======
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
@@ -24,11 +24,9 @@ app.use((req, res, next) => {
   next();
 });
 
-// ====== Защита и сжатие ======
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(compression());
 
-// ====== CORS (дублируем для надёжности) ======
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
@@ -40,7 +38,6 @@ app.options('*', cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// ====== Глобальная обработка ошибок ======
 process.on('uncaughtException', (err) => {
   console.error('💥 Uncaught Exception:', err.message);
   console.error(err.stack);
@@ -55,11 +52,9 @@ const SKYID_URL = process.env.SKYID_URL || 'https://skymutant.onrender.com';
 const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'SkyMonder';
 const HF_API_KEY = process.env.HF_API_KEY || null;
 
-// ====== Админ-панель ======
 const ADMIN_PANEL_USER = process.env.ADMIN_PANEL_USER || 'QUEUUOENGO_28937YAG';
 const ADMIN_PANEL_PASS = process.env.ADMIN_PANEL_PASS || 'BYOSOGB45BGWO45G7_34F';
 
-// ====== Директории ======
 const DATA_DIR = path.join(__dirname, 'data');
 const VIDEO_DIR = path.join(__dirname, 'videos');
 const UPLOAD_TEMP = path.join(__dirname, 'uploads');
@@ -69,7 +64,6 @@ const HLS_DIR = path.join(VIDEO_DIR, 'hls');
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 });
 
-// ====== Файловая БД ======
 function dbPut(bucket, key, data) {
   const dir = path.join(DATA_DIR, bucket);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -77,8 +71,16 @@ function dbPut(bucket, key, data) {
 }
 function dbGet(bucket, key) {
   const file = path.join(DATA_DIR, bucket, key + '.json');
-  if (!fs.existsSync(file)) return null;
-  try { return JSON.parse(fs.readFileSync(file, 'utf-8')); } catch (e) { return null; }
+  if (!fs.existsSync(file)) {
+    console.log(`📂 Файл ${file} не найден`);
+    return null;
+  }
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf-8'));
+  } catch (e) {
+    console.error(`❌ Ошибка парсинга ${file}:`, e);
+    return null;
+  }
 }
 function dbList(bucket) {
   const dir = path.join(DATA_DIR, bucket);
@@ -90,7 +92,6 @@ function dbDelete(bucket, key) {
   if (fs.existsSync(file)) fs.unlinkSync(file);
 }
 
-// ====== Multer ======
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_TEMP),
   filename: (req, file, cb) => cb(null, Date.now() + '_' + Math.random().toString(36).slice(2,8) + path.extname(file.originalname))
@@ -107,7 +108,6 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-// ====== Модерация ======
 const BAD_WORDS = [
   // ===== БАЗОВЫЕ МАТЕРНЫЕ КОРНИ (ОБСЦЕННАЯ ЛЕКСИКА) =====
   // Ядро русского мата, от которых образуются сотни производных[reference:3]
@@ -201,7 +201,6 @@ async function checkAI(text) {
   return { toxic: containsBadWords(text), score: containsBadWords(text) ? 1 : 0 };
 }
 
-// ====== Бан ======
 function banUserWithDuration(skyid, reason, days = 2) {
   const until = Date.now() + days * 24 * 60 * 60 * 1000;
   dbPut('bans', skyid, { skyid, reason, bannedAt: Date.now(), until });
@@ -214,7 +213,6 @@ function isUserBanned(skyid) {
   return true;
 }
 
-// ====== Auth ======
 async function verifySkyToken(token) {
   try {
     const res = await axios.get(`${SKYID_URL}/me`, { headers: { Authorization: `Bearer ${token}` } });
@@ -237,7 +235,6 @@ function authMiddleware(req, res, next) {
   }).catch(() => res.status(401).json({ error: 'Invalid token' }));
 }
 
-// ====== Админ-авторизация ======
 const adminSessions = new Map();
 function generateAdminToken() { return crypto.randomBytes(32).toString('hex'); }
 function adminAuthMiddleware(req, res, next) {
@@ -252,10 +249,8 @@ function adminAuthMiddleware(req, res, next) {
   next();
 }
 
-// ====== Health ======
 app.get('/healthix', (req, res) => res.json({ status: 'ok', service: 'skyvideo' }));
 
-// ====== OAuth ======
 app.get('/auth/login', (req, res) => {
   const clientId = 'skyvideo';
   const scope = req.query.scope || 'profile email';
@@ -292,7 +287,6 @@ app.get('/auth/success', (req, res) => {
   `);
 });
 
-// ====== Профиль ======
 app.get('/profile', authMiddleware, (req, res) => {
   let profile = dbGet('profiles', req.user.skyid);
   if (!profile) profile = { name: req.user.login, avatar: '', bio: '' };
@@ -305,7 +299,6 @@ app.put('/profile', authMiddleware, (req, res) => {
   res.json(profile);
 });
 
-// ====== Генерация превью ======
 async function generateThumbnail(videoId, videoPath) {
   const thumbPath = path.join(THUMB_DIR, videoId + '.jpg');
   try {
@@ -330,7 +323,6 @@ async function generateThumbnail(videoId, videoPath) {
   }
 }
 
-// ====== Фоновая обработка видео (HLS) ======
 async function processVideoInBackground(videoId, originalPath) {
   console.log(`🔄 Начинаем обработку видео ${videoId}`);
   try {
@@ -424,7 +416,6 @@ async function processVideoInBackground(videoId, originalPath) {
   }
 }
 
-// ====== Загрузка видео ======
 app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => {
   try {
     const file = req.file;
@@ -464,6 +455,7 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
       qualities: []
     };
     dbPut('videos', videoId, meta);
+    console.log(`📝 Запись в БД создана для ${videoId}`);
 
     processVideoInBackground(videoId, videoPath);
 
@@ -477,34 +469,62 @@ app.post('/upload', authMiddleware, upload.single('video'), async (req, res) => 
   }
 });
 
-// ====== Раздача превью ======
 app.get('/thumbnails/:filename', (req, res) => {
   const thumbPath = path.join(THUMB_DIR, req.params.filename);
-  if (!fs.existsSync(thumbPath)) return res.status(404).json({ error: 'Not found' });
-  res.sendFile(thumbPath);
+  if (!fs.existsSync(thumbPath)) {
+    console.warn(`⚠️ Превью не найдено: ${thumbPath}`);
+    return res.status(404).json({ error: 'Thumbnail not found' });
+  }
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'image/jpeg');
+  const stream = fs.createReadStream(thumbPath);
+  stream.on('error', (err) => {
+    console.error('❌ Ошибка чтения превью:', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+  });
+  stream.pipe(res);
 });
 
-// ====== HLS endpoints ======
 app.get('/video/:videoId/master.m3u8', (req, res) => {
   const masterPath = path.join(HLS_DIR, req.params.videoId, 'master.m3u8');
-  if (!fs.existsSync(masterPath)) return res.status(404).send('Master playlist not found');
-  res.set('Content-Type', 'application/vnd.apple.mpegurl');
+  if (!fs.existsSync(masterPath)) {
+    return res.status(404).send('Master playlist not found');
+  }
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
   res.sendFile(masterPath);
 });
 app.get('/video/:videoId/:quality/playlist.m3u8', (req, res) => {
   const playlistPath = path.join(HLS_DIR, req.params.videoId, req.params.quality, 'playlist.m3u8');
-  if (!fs.existsSync(playlistPath)) return res.status(404).send('Playlist not found');
-  res.set('Content-Type', 'application/vnd.apple.mpegurl');
+  if (!fs.existsSync(playlistPath)) {
+    return res.status(404).send('Playlist not found');
+  }
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
   res.sendFile(playlistPath);
 });
 app.get('/video/:videoId/:quality/:segment', (req, res) => {
   const segPath = path.join(HLS_DIR, req.params.videoId, req.params.quality, req.params.segment);
-  if (!fs.existsSync(segPath)) return res.status(404).send('Segment not found');
-  res.set('Content-Type', 'video/MP2T');
+  if (!fs.existsSync(segPath)) {
+    return res.status(404).send('Segment not found');
+  }
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'video/MP2T');
   res.sendFile(segPath);
 });
 
-// ====== СТАРЫЙ ЭНДПОИНТ /video/:id (редирект на HLS если есть) ======
+app.get('/video/:id/meta', (req, res) => {
+  const id = req.params.id;
+  console.log(`🔍 Запрос метаданных для ID: ${id}`);
+  const meta = dbGet('videos', id);
+  if (!meta) {
+    console.warn(`⚠️ Видео ${id} не найдено в БД`);
+    return res.status(404).json({ error: 'Video not found in database' });
+  }
+  console.log(`✅ Метаданные для ${id} отправлены`);
+  res.json(meta);
+});
+
 app.get('/video/:id', (req, res) => {
   const meta = dbGet('videos', req.params.id);
   if (!meta) {
@@ -513,11 +533,9 @@ app.get('/video/:id', (req, res) => {
   if (meta.status !== 'ready') {
     return res.status(202).json({ error: 'Video is still processing' });
   }
-  // Если есть HLS, редиректим на мастер-плейлист
   if (meta.hlsMaster) {
     return res.redirect(meta.hlsMaster);
   }
-  // Fallback: если есть MP4-файл (старый вариант)
   const videoPath = path.join(VIDEO_DIR, meta.filename);
   if (!fs.existsSync(videoPath)) {
     return res.status(404).json({ error: 'File not found' });
@@ -525,11 +543,417 @@ app.get('/video/:id', (req, res) => {
   res.sendFile(videoPath);
 });
 
-// ====== Остальные эндпоинты (лайки, комментарии, подписки, админка) ======
-// ... (они уже есть в предыдущих версиях, включаем их)
-// Чтобы не перегружать ответ, я вставлю сокращённую версию, но в реальном файле они должны быть полные.
+app.get('/video/:id/status', (req, res) => {
+  const meta = dbGet('videos', req.params.id);
+  if (!meta) return res.status(404).json({ error: 'Not found' });
+  res.json({ status: meta.status, hlsMaster: meta.hlsMaster });
+});
 
-// ====== Список видео ======
+app.post('/video/:id/like', authMiddleware, (req, res) => {
+  const meta = dbGet('videos', req.params.id);
+  if (!meta) return res.status(404).json({ error: 'Not found' });
+  meta.dislikes = meta.dislikes.filter(u => u !== req.user.skyid);
+  if (!meta.likes.includes(req.user.skyid)) meta.likes.push(req.user.skyid);
+  else meta.likes = meta.likes.filter(u => u !== req.user.skyid);
+  dbPut('videos', req.params.id, meta);
+  res.json({ likes: meta.likes.length, dislikes: meta.dislikes.length });
+});
+app.post('/video/:id/dislike', authMiddleware, (req, res) => {
+  const meta = dbGet('videos', req.params.id);
+  if (!meta) return res.status(404).json({ error: 'Not found' });
+  meta.likes = meta.likes.filter(u => u !== req.user.skyid);
+  if (!meta.dislikes.includes(req.user.skyid)) meta.dislikes.push(req.user.skyid);
+  else meta.dislikes = meta.dislikes.filter(u => u !== req.user.skyid);
+  dbPut('videos', req.params.id, meta);
+  res.json({ likes: meta.likes.length, dislikes: meta.dislikes.length });
+});
+
+app.post('/video/:id/view', (req, res) => {
+  const meta = dbGet('videos', req.params.id);
+  if (!meta) return res.status(404).json({ error: 'Not found' });
+  meta.views = (meta.views || 0) + 1;
+  dbPut('videos', req.params.id, meta);
+  res.json({ views: meta.views });
+});
+
+app.get('/video/:id/comments', (req, res) => {
+  const meta = dbGet('videos', req.params.id);
+  if (!meta) return res.status(404).json({ error: 'Not found' });
+  res.json(meta.comments || []);
+});
+app.post('/video/:id/comment', authMiddleware, async (req, res) => {
+  const meta = dbGet('videos', req.params.id);
+  if (!meta) return res.status(404).json({ error: 'Not found' });
+  const { text } = req.body;
+  if (!text) return res.status(400).json({ error: 'Text required' });
+  const aiResult = await checkAI(text);
+  if (aiResult.toxic) {
+    banUserWithDuration(req.user.skyid, 'Токсичный комментарий');
+    return res.status(403).json({ error: 'Ваш комментарий содержит неприемлемый контент. Вы забанены на 2 дня.' });
+  }
+  const comment = { id: 'cmt_' + Date.now(), skyid: req.user.skyid, author: req.user.login, text, created: Date.now() };
+  meta.comments.push(comment);
+  dbPut('videos', req.params.id, meta);
+  res.json(comment);
+});
+app.put('/video/:id/comment/:commentId', authMiddleware, async (req, res) => {
+  const meta = dbGet('videos', req.params.id);
+  if (!meta) return res.status(404).json({ error: 'Not found' });
+  const comment = meta.comments.find(c => c.id === req.params.commentId);
+  if (!comment) return res.status(404).json({ error: 'Comment not found' });
+  if (comment.skyid !== req.user.skyid && !req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
+  const aiResult = await checkAI(req.body.text);
+  if (aiResult.toxic) {
+    banUserWithDuration(req.user.skyid, 'Токсичный комментарий (редактирование)');
+    return res.status(403).json({ error: 'Ваш комментарий содержит неприемлемый контент. Вы забанены на 2 дня.' });
+  }
+  comment.text = req.body.text;
+  dbPut('videos', req.params.id, meta);
+  res.json(comment);
+});
+app.delete('/video/:id/comment/:commentId', authMiddleware, (req, res) => {
+  const meta = dbGet('videos', req.params.id);
+  if (!meta) return res.status(404).json({ error: 'Not found' });
+  const comment = meta.comments.find(c => c.id === req.params.commentId);
+  if (!comment) return res.status(404).json({ error: 'Comment not found' });
+  if (comment.skyid !== req.user.skyid && !req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
+  meta.comments = meta.comments.filter(c => c.id !== req.params.commentId);
+  dbPut('videos', req.params.id, meta);
+  res.json({ ok: true });
+});
+
+app.delete('/video/:id', authMiddleware, (req, res) => {
+  const meta = dbGet('videos', req.params.id);
+  if (!meta) return res.status(404).json({ error: 'Not found' });
+  if (meta.authorSkyid !== req.user.skyid && !req.isAdmin) return res.status(403).json({ error: 'Forbidden' });
+  const hlsDir = path.join(HLS_DIR, req.params.id);
+  if (fs.existsSync(hlsDir)) fs.rmSync(hlsDir, { recursive: true, force: true });
+  const thumbPath = path.join(THUMB_DIR, meta.id + '.jpg');
+  if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
+  dbDelete('videos', req.params.id);
+  res.json({ ok: true });
+});
+
+app.post('/follow/:skyid', authMiddleware, (req, res) => {
+  const targetSkyid = req.params.skyid;
+  if (targetSkyid === req.user.skyid) return res.status(400).json({ error: 'Нельзя подписаться на себя' });
+  let follows = dbGet('follows', req.user.skyid) || { following: [] };
+  if (!follows.following.includes(targetSkyid)) {
+    follows.following.push(targetSkyid);
+    dbPut('follows', req.user.skyid, follows);
+  }
+  res.json({ ok: true, following: follows.following });
+});
+app.delete('/follow/:skyid', authMiddleware, (req, res) => {
+  const targetSkyid = req.params.skyid;
+  let follows = dbGet('follows', req.user.skyid) || { following: [] };
+  follows.following = follows.following.filter(id => id !== targetSkyid);
+  dbPut('follows', req.user.skyid, follows);
+  res.json({ ok: true, following: follows.following });
+});
+app.get('/follow/following', authMiddleware, (req, res) => {
+  const follows = dbGet('follows', req.user.skyid) || { following: [] };
+  res.json({ following: follows.following });
+});
+app.get('/follow/followers/:skyid', (req, res) => {
+  const targetSkyid = req.params.skyid;
+  const allFollows = dbList('follows');
+  const followers = [];
+  for (const id of allFollows) {
+    const data = dbGet('follows', id);
+    if (data && data.following.includes(targetSkyid)) {
+      followers.push(id);
+    }
+  }
+  res.json({ followers });
+});
+app.get('/follow/check/:skyid', authMiddleware, (req, res) => {
+  const targetSkyid = req.params.skyid;
+  const follows = dbGet('follows', req.user.skyid) || { following: [] };
+  res.json({ isFollowing: follows.following.includes(targetSkyid) });
+});
+
+app.post('/admin/login', (req, res) => {
+  const { login, password } = req.body;
+  if (login === ADMIN_PANEL_USER && password === ADMIN_PANEL_PASS) {
+    const token = generateAdminToken();
+    adminSessions.set(token, { created: Date.now(), expires: Date.now() + 3600000 });
+    return res.json({ ok: true, token });
+  }
+  return res.status(401).json({ error: 'Неверные учётные данные' });
+});
+
+app.get('/admin/panel', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="UTF-8">
+      <title>Админ-панель SkyVideo</title>
+      <style>
+        body { background: #0a0f1e; color: #e0e8ff; font-family: Arial, sans-serif; padding: 20px; }
+        h1 { color: #5f7ecf; }
+        .admin-section { background: #1a233a; border: 1px solid #2a3450; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+        .admin-section h2 { border-bottom: 1px solid #2a3450; padding-bottom: 10px; }
+        button { background: #5f7ecf; border: none; color: white; padding: 6px 12px; border-radius: 6px; cursor: pointer; }
+        .btn-danger { background: #c44; }
+        .item { background: #111827; padding: 10px; border-radius: 8px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+        .item .actions { display: flex; gap: 8px; }
+        input, textarea { background: #0d1225; border: 1px solid #3a4660; color: white; padding: 6px; border-radius: 6px; width: 100%; margin-bottom: 8px; }
+        .error-message { color: #f48024; text-align: center; margin-top: 20px; }
+        .login-form { max-width: 400px; margin: 0 auto; }
+        .login-form input { width: 100%; padding: 10px; margin-bottom: 10px; }
+        .login-form button { width: 100%; }
+        .hidden { display: none; }
+      </style>
+    </head>
+    <body>
+      <h1>🛡️ Админ-панель SkyVideo</h1>
+      <div id="app">
+        <div id="login-form" class="login-form">
+          <h2>Вход в админ-панель</h2>
+          <input type="text" id="admin-login" placeholder="Логин">
+          <input type="password" id="admin-password" placeholder="Пароль">
+          <button onclick="login()">Войти</button>
+          <div id="login-error" style="color:#c44; margin-top:10px;"></div>
+        </div>
+        <div id="admin-content" class="hidden">
+          <div class="admin-section">
+            <h2>📹 Все видео</h2>
+            <div id="video-list">Загрузка...</div>
+          </div>
+          <div class="admin-section">
+            <h2>💬 Все комментарии</h2>
+            <div id="comments-list">Загрузка...</div>
+          </div>
+          <div class="admin-section">
+            <h2>🚫 Бан пользователей</h2>
+            <input type="text" id="ban-skyid" placeholder="SkyID пользователя">
+            <button onclick="banUser()">Забанить (2 дня)</button>
+            <button onclick="unbanUser()" class="btn-danger">Разбанить</button>
+            <div id="ban-result"></div>
+          </div>
+          <div class="admin-section">
+            <h2>🔒 Забаненные (срок)</h2>
+            <div id="banned-list">Загрузка...</div>
+          </div>
+        </div>
+      </div>
+      <script>
+        const API_BASE = '';
+        let adminToken = localStorage.getItem('admin_token') || '';
+
+        function checkAuth() {
+          if (!adminToken) {
+            document.getElementById('login-form').style.display = 'block';
+            document.getElementById('admin-content').style.display = 'none';
+            return;
+          }
+          fetch(API_BASE + '/admin/videos', {
+            headers: { 'Authorization': 'Bearer ' + adminToken }
+          })
+          .then(res => {
+            if (res.ok) {
+              document.getElementById('login-form').style.display = 'none';
+              document.getElementById('admin-content').style.display = 'block';
+              loadVideos();
+              loadComments();
+              loadBanned();
+            } else {
+              localStorage.removeItem('admin_token');
+              adminToken = '';
+              document.getElementById('login-form').style.display = 'block';
+              document.getElementById('admin-content').style.display = 'none';
+            }
+          })
+          .catch(() => {
+            localStorage.removeItem('admin_token');
+            adminToken = '';
+            document.getElementById('login-form').style.display = 'block';
+            document.getElementById('admin-content').style.display = 'none';
+          });
+        }
+
+        async function login() {
+          const login = document.getElementById('admin-login').value.trim();
+          const password = document.getElementById('admin-password').value.trim();
+          if (!login || !password) {
+            document.getElementById('login-error').textContent = 'Заполните все поля';
+            return;
+          }
+          try {
+            const res = await fetch(API_BASE + '/admin/login', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ login, password })
+            });
+            const data = await res.json();
+            if (res.ok) {
+              localStorage.setItem('admin_token', data.token);
+              adminToken = data.token;
+              document.getElementById('login-error').textContent = '';
+              checkAuth();
+            } else {
+              document.getElementById('login-error').textContent = data.error || 'Ошибка входа';
+            }
+          } catch (e) {
+            document.getElementById('login-error').textContent = 'Ошибка соединения';
+          }
+        }
+
+        async function apiFetch(url, options = {}) {
+          const headers = { 'Content-Type': 'application/json' };
+          if (adminToken) headers['Authorization'] = 'Bearer ' + adminToken;
+          const res = await fetch(API_BASE + url, { ...options, headers });
+          if (!res.ok) {
+            if (res.status === 401) {
+              localStorage.removeItem('admin_token');
+              adminToken = '';
+              document.getElementById('login-form').style.display = 'block';
+              document.getElementById('admin-content').style.display = 'none';
+              throw new Error('Unauthorized');
+            }
+            throw new Error(await res.text());
+          }
+          return res.json();
+        }
+
+        async function loadVideos() {
+          const data = await apiFetch('/admin/videos');
+          const container = document.getElementById('video-list');
+          if (!data.length) { container.innerHTML = '<p>Нет видео</p>'; return; }
+          container.innerHTML = data.map(v => \`
+            <div class="item">
+              <div><strong>\${v.title}</strong> (автор: \${v.author})</div>
+              <div class="actions">
+                <button onclick="deleteVideo('\${v.id}')" class="btn-danger">Удалить</button>
+              </div>
+            </div>
+          \`).join('');
+        }
+
+        async function loadComments() {
+          const videos = await apiFetch('/admin/videos');
+          let allComments = [];
+          for (const v of videos) {
+            allComments = allComments.concat((v.comments || []).map(c => ({ ...c, videoId: v.id, videoTitle: v.title })));
+          }
+          const container = document.getElementById('comments-list');
+          if (!allComments.length) { container.innerHTML = '<p>Нет комментариев</p>'; return; }
+          container.innerHTML = allComments.map(c => \`
+            <div class="item">
+              <div><strong>\${c.author}</strong>: \${c.text} (видео: \${c.videoTitle})</div>
+              <div class="actions">
+                <button onclick="deleteComment('\${c.videoId}','\${c.id}')" class="btn-danger">Удалить</button>
+              </div>
+            </div>
+          \`).join('');
+        }
+
+        async function deleteVideo(videoId) {
+          if (!confirm('Удалить видео?')) return;
+          await apiFetch('/admin/video/' + videoId, { method: 'DELETE' });
+          loadVideos();
+        }
+
+        async function deleteComment(videoId, commentId) {
+          if (!confirm('Удалить комментарий?')) return;
+          await apiFetch('/admin/comment/' + videoId + '/' + commentId, { method: 'DELETE' });
+          loadComments();
+        }
+
+        async function banUser() {
+          const skyid = document.getElementById('ban-skyid').value.trim();
+          if (!skyid) return alert('Введите SkyID');
+          await apiFetch('/admin/ban', { method: 'POST', body: JSON.stringify({ skyid }) });
+          document.getElementById('ban-result').textContent = '✅ Пользователь забанен на 2 дня';
+          loadBanned();
+        }
+
+        async function unbanUser() {
+          const skyid = document.getElementById('ban-skyid').value.trim();
+          if (!skyid) return alert('Введите SkyID');
+          await apiFetch('/admin/unban', { method: 'POST', body: JSON.stringify({ skyid }) });
+          document.getElementById('ban-result').textContent = '✅ Пользователь разбанен';
+          loadBanned();
+        }
+
+        async function loadBanned() {
+          const data = await apiFetch('/admin/banned');
+          const container = document.getElementById('banned-list');
+          if (!data.length) { container.innerHTML = '<p>Нет забаненных</p>'; return; }
+          container.innerHTML = data.map(b => \`
+            <div class="item">
+              <div>
+                <strong>\${b.skyid}</strong>
+                <span style="color:#8899cc;">(до \${new Date(b.until).toLocaleString()})</span>
+              </div>
+              <div class.actions">
+                <button onclick="unbanUserById('\${b.skyid}')" class="btn-danger">Разбанить</button>
+              </div>
+            </div>
+          \`).join('');
+        }
+
+        window.unbanUserById = async (skyid) => {
+          await apiFetch('/admin/unban', { method: 'POST', body: JSON.stringify({ skyid }) });
+          loadBanned();
+        };
+
+        checkAuth();
+      </script>
+    </body>
+    </html>
+  `);
+});
+
+app.get('/admin/videos', adminAuthMiddleware, (req, res) => {
+  const ids = dbList('videos');
+  const videos = ids.map(id => dbGet('videos', id)).filter(Boolean).sort((a,b) => b.created - a.created);
+  res.json(videos);
+});
+
+app.delete('/admin/video/:videoId', adminAuthMiddleware, (req, res) => {
+  const meta = dbGet('videos', req.params.videoId);
+  if (!meta) return res.status(404).json({ error: 'Not found' });
+  const hlsDir = path.join(HLS_DIR, req.params.videoId);
+  if (fs.existsSync(hlsDir)) fs.rmSync(hlsDir, { recursive: true, force: true });
+  const thumbPath = path.join(THUMB_DIR, meta.id + '.jpg');
+  if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
+  dbDelete('videos', req.params.videoId);
+  res.json({ ok: true });
+});
+
+app.delete('/admin/comment/:videoId/:commentId', adminAuthMiddleware, (req, res) => {
+  const meta = dbGet('videos', req.params.videoId);
+  if (!meta) return res.status(404).json({ error: 'Video not found' });
+  const comment = meta.comments.find(c => c.id === req.params.commentId);
+  if (!comment) return res.status(404).json({ error: 'Comment not found' });
+  meta.comments = meta.comments.filter(c => c.id !== req.params.commentId);
+  dbPut('videos', req.params.videoId, meta);
+  res.json({ ok: true });
+});
+
+app.post('/admin/ban', adminAuthMiddleware, (req, res) => {
+  const { skyid } = req.body;
+  if (!skyid) return res.status(400).json({ error: 'skyid required' });
+  banUserWithDuration(skyid, 'Ручной бан (админ)', 2);
+  res.json({ ok: true });
+});
+
+app.post('/admin/unban', adminAuthMiddleware, (req, res) => {
+  const { skyid } = req.body;
+  dbDelete('bans', skyid);
+  res.json({ ok: true });
+});
+
+app.get('/admin/banned', adminAuthMiddleware, (req, res) => {
+  const ids = dbList('bans');
+  const banned = ids.map(id => dbGet('bans', id)).filter(Boolean);
+  const active = banned.filter(b => !b.until || Date.now() < b.until);
+  res.json(active);
+});
+
 app.get('/list', (req, res) => {
   try {
     const ids = dbList('videos');
@@ -541,7 +965,6 @@ app.get('/list', (req, res) => {
   }
 });
 
-// ====== Поиск ======
 app.get('/search', (req, res) => {
   const q = (req.query.q || '').toLowerCase();
   const ids = dbList('videos');
@@ -558,12 +981,10 @@ app.get('/search', (req, res) => {
   res.json(results.sort((a,b) => b.created - a.created));
 });
 
-// ====== Проверка токена ======
 app.get('/verify', authMiddleware, (req, res) => {
   res.json({ user: req.user, isAdmin: req.isAdmin });
 });
 
-// ====== Запуск ======
 const server = http.createServer(app);
 server.timeout = 30 * 60 * 1000;
 server.keepAliveTimeout = 30 * 60 * 1000;
@@ -571,6 +992,7 @@ server.headersTimeout = 60 * 60 * 1000;
 
 server.listen(PORT, () => {
   console.log(`🚀 SkyVideo running on port ${PORT}`);
+  console.log(`⚡ Все CORS-заголовки принудительно установлены`);
   console.log(`⚡ Полный функционал: ИИ, FFmpeg, HLS, превью`);
   console.log(`🤖 ИИ-модерация ${HF_API_KEY ? 'активна' : 'отключена (локальный список)'}`);
 });
